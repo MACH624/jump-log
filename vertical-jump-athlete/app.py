@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Vertical Jump Lab - local Streamlit app, Python 3.11.
+"""Jump Log - athlete tracker, screen navigation and diagnostics update, Python 3.11.
 Dependencies: streamlit==1.40.1, mediapipe==0.10.21,
 opencv-python-headless==4.11.0.86, numpy==1.26.4, imageio-ffmpeg, pandas.
 """
@@ -8,12 +8,16 @@ import uuid
 import sqlite3
 import subprocess
 import tempfile
+import shutil
+import urllib.request
+from types import SimpleNamespace
 from datetime import datetime, date
 from pathlib import Path
 
 import cv2
 import imageio_ffmpeg
 import mediapipe as mp
+from mediapipe.framework.formats import landmark_pb2
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -241,6 +245,120 @@ def to_preview_jpeg(frame, max_side=480):
     return buffer.tobytes() if ok else b""
 
 
+
+# ================================================
+# High-accuracy pose model: MediaPipe Tasks API
+# The legacy MediaPipe Pose tries to download Heavy into
+# site-packages (read-only on Streamlit Community Cloud).
+# Tasks instead accepts an explicit, writable model path.
+# ================================================
+HEAVY_TASK_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task"
+)
+
+
+def get_heavy_model_path():
+    """Download the official Heavy model to a writable temporary directory.
+
+    It is reused by subsequent analyses while the app's server is running.
+    """
+    model_path = Path(tempfile.gettempdir()) / "jump_log_pose_models" / "pose_landmarker_heavy.task"
+    if model_path.is_file() and model_path.stat().st_size > 20_000_000:
+        return model_path
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = model_path.with_name(model_path.name + "." + uuid.uuid4().hex + ".part")
+    try:
+        with urllib.request.urlopen(HEAVY_TASK_URL, timeout=90) as response:
+            with temp_path.open("wb") as dest:
+                shutil.copyfileobj(response, dest)
+        if temp_path.stat().st_size < 20_000_000:
+            raise RuntimeError("Heavyモデルのダウンロードが不完全です。")
+        temp_path.replace(model_path)
+        return model_path
+    except Exception as exc:
+        raise RuntimeError(
+            "高精度モデルの取得に失敗しました。通信状態を確認して再度お試しください。"
+            f" 詳細: {exc}"
+        ) from exc
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+class PoseProcessor:
+    """Adapt the Tasks Heavy model to the existing legacy Pose result format."""
+
+    def __init__(self, complexity):
+        self.is_heavy = (complexity == 2)
+        self._last_timestamp_ms = -1
+        self._legacy = None
+        self._task = None
+        if self.is_heavy:
+            from mediapipe.tasks import python as tasks_python
+            from mediapipe.tasks.python import vision
+
+            options = vision.PoseLandmarkerOptions(
+                base_options=tasks_python.BaseOptions(
+                    model_asset_path=str(get_heavy_model_path())
+                ),
+                running_mode=vision.RunningMode.VIDEO,
+                num_poses=1,
+                min_pose_detection_confidence=0.55,
+                min_pose_presence_confidence=0.55,
+                min_tracking_confidence=0.55,
+            )
+            self._task = vision.PoseLandmarker.create_from_options(options)
+        else:
+            self._legacy = mp.solutions.pose.Pose(
+                static_image_mode=False,
+                model_complexity=complexity,
+                smooth_landmarks=True,
+                enable_segmentation=False,
+                min_detection_confidence=0.55,
+                min_tracking_confidence=0.55,
+            )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._task is not None:
+            self._task.close()
+        if self._legacy is not None:
+            self._legacy.close()
+
+    def process(self, rgb, frame_index, fps):
+        if not self.is_heavy:
+            return self._legacy.process(rgb)
+
+        # Video mode requires strictly increasing frame timestamps in ms.
+        timestamp_ms = max(
+            self._last_timestamp_ms + 1,
+            int(round(frame_index * 1000.0 / fps)),
+        )
+        self._last_timestamp_ms = timestamp_ms
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=np.ascontiguousarray(rgb).copy(),
+        )
+        task_result = self._task.detect_for_video(mp_image, timestamp_ms)
+        if not task_result.pose_landmarks:
+            return SimpleNamespace(pose_landmarks=None)
+
+        # The existing pose_features()/draw_landmarks() expect protobufs.
+        landmarks = landmark_pb2.NormalizedLandmarkList()
+        for src in task_result.pose_landmarks[0]:
+            dst = landmarks.landmark.add()
+            dst.x = float(src.x)
+            dst.y = float(src.y)
+            dst.z = float(src.z)
+            if src.visibility is not None:
+                dst.visibility = float(src.visibility)
+            if src.presence is not None:
+                dst.presence = float(src.presence)
+        return SimpleNamespace(pose_landmarks=landmarks)
+
+
 def analyze_video(video_bytes, suffix, model_complexity, display_progress):
     """Run every frame with MediaPipe; output review JPGs and H264 MP4."""
     cap = None
@@ -281,14 +399,7 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress):
             landmark_count = 0
             draw = mp.solutions.drawing_utils
             pose_api = mp.solutions.pose
-            with pose_api.Pose(
-                static_image_mode=False,
-                model_complexity=model_complexity,
-                smooth_landmarks=True,
-                enable_segmentation=False,
-                min_detection_confidence=0.55,
-                min_tracking_confidence=0.55,
-            ) as pose:
+            with PoseProcessor(model_complexity) as pose:
                 index = 0
                 while True:
                     ok, frame = cap.read()
@@ -298,7 +409,7 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress):
                         frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     rgb.flags.writeable = False
-                    result = pose.process(rgb)
+                    result = pose.process(rgb, index, fps)
                     rgb.flags.writeable = True
                     features = pose_features(result, h)
                     for column, val in zip(props, features):
@@ -606,7 +717,7 @@ def render_measure_tab(athlete_id, history):
         with st.expander("元動画を確認", expanded=False):
             st.video(video_bytes, format="video/mp4")
     with st.expander("AI解析の設定", expanded=False):
-        model = st.selectbox("骨格モデル", [2, 1, 0], index=0,
+        model = st.selectbox("骨格モデル", [2, 1, 0], index=1,
                              format_func=lambda x: {2: "高精度 / Heavy（時間がかかる）", 1: "標準 / Full", 0: "高速 / Lite"}[x])
         st.caption("骨格の検出精度を高めても、離地・着地判定の正確さが保証されるわけではありません。")
     if st.button("AIでジャンプを解析する", type="primary", use_container_width=True):
@@ -833,23 +944,38 @@ def main():
         st.divider()
         st.caption("データはこのPC内に保存されます。")
     history = get_measurements(selected)
-    tab_home, tab_new, tab_hist, tab_info = st.tabs(
-        ["🏠 ホーム", "📹 新規測定", "📒 測定履歴", "ℹ️ 使い方"]
+    # Streamlit tabs execute *all* tab contents on every rerun.  This includes
+    # video processing/rendering that is not visible on the selected tab.
+    # Conditional navigation keeps screens independent and substantially
+    # reduces unintended side effects and memory pressure.
+    pages = ["🏠 ホーム", "📹 新規測定", "📒 測定履歴", "ℹ️ 使い方"]
+    chosen_page = st.radio(
+        "画面を選択", pages,
+        key="jump_log_current_page",
+        horizontal=True,
+        label_visibility="collapsed",
     )
-    with tab_home:
-        st.markdown(f"### {athlete_names[selected]} の記録")
-        display_athlete_dashboard(history)
-        st.divider()
-        st.markdown("**使い方**")
-        st.write("① 動画を撮影 → ② AIで測定 → ③ 離地と着地を確認 → ④ 日付・メモ付きで保存 → ⑤ 過去の結果と比較")
-        if history.empty:
-            st.info("まず『新規測定』タブから最初のジャンプを登録しましょう。")
-    with tab_new:
-        render_measure_tab(selected, history)
-    with tab_hist:
-        render_history_tab(selected, history)
-    with tab_info:
-        render_howto_tab()
+    st.divider()
+
+    try:
+        if chosen_page == pages[0]:
+            st.markdown(f"### {athlete_names[selected]} の記録")
+            display_athlete_dashboard(history)
+            st.divider()
+            st.markdown("**使い方**")
+            st.write("① 動画を撮影 → ② AIで測定 → ③ 離地と着地を確認 → ④ 日付・メモ付きで保存 → ⑤ 過去の結果と比較")
+            if history.empty:
+                st.info("まず『新規測定』から最初のジャンプを登録しましょう。")
+        elif chosen_page == pages[1]:
+            render_measure_tab(selected, history)
+        elif chosen_page == pages[2]:
+            render_history_tab(selected, history)
+        else:
+            render_howto_tab()
+    except Exception as exc:
+        st.error(f"『{chosen_page}』画面の表示中にエラーが発生しました。")
+        st.exception(exc)
+        st.info("ここに表示された赤いエラーと詳細をコピーすると、原因を特定できます。測定履歴は削除されていません。")
     st.divider()
     st.caption("Jump Log | 個人記録向けのローカル試作版。自動判定結果は目視確認が必要です。")
 
