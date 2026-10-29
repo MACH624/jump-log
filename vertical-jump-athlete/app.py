@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Jump Log - athlete tracker, screen navigation and diagnostics update, Python 3.11.
+"""Jump Log - athlete tracker, capture-FPS-aware processing, Python 3.11.
 Dependencies: streamlit==1.40.1, mediapipe==0.10.21,
 opencv-python-headless==4.11.0.86, numpy==1.26.4, imageio-ffmpeg, pandas.
 """
@@ -236,12 +236,12 @@ def detect_events(left_raw, right_raw, hip_raw, scale_raw, fps, times):
     return out
 
 
-def to_preview_jpeg(frame, max_side=480):
+def to_preview_jpeg(frame, max_side=400):
     h, w = frame.shape[:2]
     factor = min(1.0, max_side / max(h, w))
     if factor < 1:
         frame = cv2.resize(frame, (int(w * factor), int(h * factor)))
-    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 68])
+    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
     return buffer.tobytes() if ok else b""
 
 
@@ -359,7 +359,7 @@ class PoseProcessor:
         return SimpleNamespace(pose_landmarks=landmarks)
 
 
-def analyze_video(video_bytes, suffix, model_complexity, display_progress):
+def analyze_video(video_bytes, suffix, model_complexity, display_progress, capture_fps_override=None):
     """Run every frame with MediaPipe; output review JPGs and H264 MP4."""
     cap = None
     writer = None
@@ -373,9 +373,15 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress):
             cap = cv2.VideoCapture(str(raw_input))
             if not cap.isOpened():
                 raise RuntimeError("動画を開けません。MP4（H.264）形式に変換して試してください。")
-            fps = float(cap.get(cv2.CAP_PROP_FPS))
+            # OpenCV reports the *playback* FPS stored in the file, not
+            # necessarily the camera's capture FPS (e.g. iPhone slow-motion).
+            source_fps = float(cap.get(cv2.CAP_PROP_FPS))
+            if capture_fps_override is not None:
+                fps = float(capture_fps_override)
+            else:
+                fps = source_fps
             if not np.isfinite(fps) or fps <= 1 or fps > 500:
-                raise RuntimeError("動画のFPSを取得できません。入力動画を確認してください。")
+                raise RuntimeError("動画のFPSを取得できません。スロー動画の場合は撮影時FPSを手動指定してください。")
             source_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             source_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -439,7 +445,13 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress):
             # Prefer actual timestamps if available and consistent; otherwise CFR.
             pos = np.asarray(timestamps_ms, dtype=float) / 1000.0
             dt = np.diff(pos)
-            if (np.all(np.isfinite(pos)) and len(dt)
+            # A deliberate high-FPS override means the file is a uniformly
+            # slowed-down recording; playback PTS must not be used for physics.
+            # Do not override an ordinary 30fps video: no frames are created.
+            if capture_fps_override is not None:
+                times = np.arange(n, dtype=float) / fps
+                time_source = f"撮影時FPS {fps:g}で再計算（手動指定）"
+            elif (np.all(np.isfinite(pos)) and len(dt)
                     and np.all(dt > 0) and 0.5 / fps <= float(np.median(dt)) <= 2.0 / fps):
                 times = pos - pos[0]
                 time_source = "動画タイムスタンプ"
@@ -459,7 +471,8 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress):
                 raise RuntimeError("H.264変換に失敗しました: " + converted.stderr[-900:])
             display_progress.progress(1.0)
             return {
-                "fps": fps, "frames": n, "times": times,
+                "fps": fps, "source_fps": source_fps,
+                "fps_override": capture_fps_override, "frames": n, "times": times,
                 "time_source": time_source, "pose_coverage": landmark_count / n,
                 "prediction": prediction, "preview_frames": frames_jpeg,
                 "video_h264": h264_output.read_bytes(), "resolution": (w, h),
@@ -720,12 +733,39 @@ def render_measure_tab(athlete_id, history):
         model = st.selectbox("骨格モデル", [2, 1, 0], index=1,
                              format_func=lambda x: {2: "高精度 / Heavy（時間がかかる）", 1: "標準 / Full", 0: "高速 / Lite"}[x])
         st.caption("骨格の検出精度を高めても、離地・着地判定の正確さが保証されるわけではありません。")
+        fps_modes = {
+            "自動（動画ファイルに記録されたFPSを使用）": None,
+            "120fpsで撮影したスロー動画（実時間に補正）": 120,
+            "60fpsで撮影したスロー動画（実時間に補正）": 60,
+            "240fpsで撮影したスロー動画（実時間に補正）": 240,
+        }
+        fps_mode = st.selectbox(
+            "時間計算に使用するFPS",
+            list(fps_modes), index=0, key="fps_mode",
+            help="通常の120fpsファイルは『自動』で120fpsのまま解析します。"
+        )
+        fps_override = fps_modes[fps_mode]
+        if fps_override is not None:
+            st.warning(
+                "この補正は、元動画が本当に指定FPSで撮影され、全フレームが残っている"
+                "スローモーション動画の場合に限り使用してください。普通の30fps動画を"
+                "120に指定しても画質や時間分解能は向上せず、測定値が不正確になります。"
+            )
+        else:
+            st.caption(
+                "撮影時の120fpsがファイルにも記録されていれば、そのまま120fpsで解析します。"
+                "iPhoneのスローモーション動画は30fps再生として保存される場合があるため、"
+                "その場合だけ撮影時FPSを指定してください。"
+            )
     if st.button("AIでジャンプを解析する", type="primary", use_container_width=True):
         progress = st.progress(0)
         status = st.empty()
         status.info("骨格検出 → 離地・着地候補の推定 → 再生用動画の生成")
         try:
-            result = analyze_video(video_bytes, Path(video.name).suffix.lower(), model, progress)
+            result = analyze_video(
+                video_bytes, Path(video.name).suffix.lower(), model, progress,
+                capture_fps_override=fps_override,
+            )
             st.session_state["analysis"] = result
             prediction = result["prediction"]
             if prediction["takeoff"] is not None:
@@ -747,14 +787,23 @@ def render_measure_tab(athlete_id, history):
     result = st.session_state.get("analysis")
     if result is None:
         return
+    if result.get("fps_override") != fps_override:
+        st.info("FPS設定を変更しました。新しい設定を適用するには『AIでジャンプを解析する』をもう一度押してください。")
     n, fps = result["frames"], result["fps"]
     pred = result["prediction"]
     st.divider()
     st.markdown("### 解析結果")
     c1, c2, c3 = st.columns(3)
-    c1.metric("動画FPS", f"{fps:.2f}")
+    c1.metric("解析FPS", f"{fps:.2f}")
     c2.metric("フレーム数", str(n))
     c3.metric("骨格検出率", f"{result['pose_coverage']*100:.0f}%")
+    detected_file_fps = result.get("source_fps", fps)
+    st.caption(f"元ファイルの再生FPS：{detected_file_fps:.2f} / 解析・出力FPS：{fps:.2f}")
+    if result.get("fps_override") is not None:
+        st.warning(
+            "撮影時FPSを手動で補正した計測値です。動画にそのFPS分の実フレームが"
+            "記録されていることを確認してください。"
+        )
     if fps < 60:
         st.warning("60fps未満の動画はフレーム誤差が大きいため、結果の解釈に注意してください。")
     if pred["takeoff"] is None:
