@@ -113,129 +113,262 @@ def segments(mask, gap_frames):
 
 
 def detect_events(left_raw, right_raw, hip_raw, scale_raw, fps, times):
-    """Conservative automatic takeoff/landing detector: never force a result.
+    """Suggest takeoff/landing from two feet and pelvis, with a conservative fallback.
 
-    Sole clearance on BOTH feet defines the flight core. Hip motion validates
-    it. Low-clearance crossings refine frame boundaries. Human review remains
-    required, since pose landmarks do not measure actual foot-ground contact.
+    This is a pose-based estimate, NOT direct foot-ground contact detection.
+    Return candidate frames for manual review, never silently finalize a jump.
     """
     n = len(left_raw)
+    nanline = np.full(n, np.nan, dtype=float)
     out = {
         "takeoff": None, "landing": None, "quality": "判定不可",
-        "reason": "", "left": np.full(n, np.nan),
-        "right": np.full(n, np.nan), "both": np.full(n, np.nan),
-        "hip": np.full(n, np.nan), "ground_left": np.nan,
-        "ground_right": np.nan, "body_scale": np.nan,
-        "coverage": 0.0, "candidates": 0,
+        "reason": "", "method": "", "score": None,
+        "left": nanline.copy(), "right": nanline.copy(),
+        "both": nanline.copy(), "hip": nanline.copy(),
+        "ground_left": np.nan, "ground_right": np.nan,
+        "body_scale": np.nan, "coverage": 0.0, "candidates": 0,
     }
-    if n < 15 or fps < 1:
-        out["reason"] = "動画が短すぎるため判定できません。"
+    times = np.asarray(times, dtype=float)
+    if (n < 20 or not np.isfinite(fps) or fps < 1 or
+            len(times) != n or not np.all(np.isfinite(times)) or
+            np.any(np.diff(times) <= 0)):
+        out["reason"] = "フレーム数またはフレーム時刻が不十分です。"
         return out
+
     left = smooth_series(left_raw, fps)
     right = smooth_series(right_raw, fps)
     hip = smooth_series(hip_raw, fps)
-    good = np.isfinite(left) & np.isfinite(right) & np.isfinite(hip)
-    out["coverage"] = float(np.mean(good))
-    if out["coverage"] < 0.60:
-        out["reason"] = "両足と腰が明瞭に見えるフレームが不足しています。"
+    valid_hip = np.isfinite(hip)
+    both_valid = np.isfinite(left) & np.isfinite(right)
+    joint_valid = both_valid & valid_hip
+    # Raw detector coverage, not interpolated/smoothed coverage.
+    raw_joint_valid = (np.isfinite(np.asarray(left_raw, dtype=float)) &
+                       np.isfinite(np.asarray(right_raw, dtype=float)) &
+                       np.isfinite(np.asarray(hip_raw, dtype=float)))
+    out["hip"] = hip
+    out["coverage"] = float(raw_joint_valid.mean())
+    if valid_hip.mean() < 0.40:
+        out["reason"] = "腰を検出できたフレームが少なすぎます。全身が映る角度で撮り直してください。"
         return out
-    valid_scale = np.asarray(scale_raw, dtype=float)
-    valid_scale = valid_scale[np.isfinite(valid_scale) & (valid_scale > 20)]
-    scale = float(np.median(valid_scale)) if len(valid_scale) else 200.0
+
+    scales = np.asarray(scale_raw, dtype=float)
+    scales = scales[np.isfinite(scales) & (scales > 20)]
+    scale = float(np.median(scales)) if len(scales) else 200.0
     out["body_scale"] = scale
+    edge = min(max(7, int(round(n * 0.16))), max(8, int(round(fps * 0.80))))
+    edge = min(edge, max(6, n // 4))
+    idx = np.arange(n, dtype=float)
 
-    # Prefer resting feet in first and last 20% of the recording.
-    edge = min(max(5, int(round(n * 0.20))), max(5, int(round(fps * 1.0))))
-
-    def estimate_floor(values):
-        sample = np.r_[values[:edge], values[-edge:]]
+    def edge_floor(values, first=True):
+        sample = values[:edge] if first else values[-edge:]
         sample = sample[np.isfinite(sample)]
-        if len(sample) < 5:
+        if len(sample) < max(4, edge // 6):
             return np.nan
-        return float(np.percentile(sample, 78))
+        # Ground-contact sole is near the LARGER y coordinates.
+        # Upper quantiles withstand an occasional lifted foot in the rest phase.
+        return float(np.percentile(sample, 70))
 
-    gl = estimate_floor(left)
-    gr = estimate_floor(right)
-    if not np.isfinite(gl) or not np.isfinite(gr):
-        out["reason"] = "床の基準位置を推定できませんでした。"
+    # Camera/pose tracking sometimes drifts vertically between the standing
+    # intervals before and after the jump. Evaluate a fixed AND a drift-
+    # compensated contact line instead of assuming one universal floor value.
+    floors = {}
+    for label, track in (("left", left), ("right", right)):
+        early, late = edge_floor(track, True), edge_floor(track, False)
+        if np.isfinite(early) and np.isfinite(late):
+            floors[label] = (early, late)
+        elif np.isfinite(early):
+            floors[label] = (early, early)
+        elif np.isfinite(late):
+            floors[label] = (late, late)
+        else:
+            floors[label] = (np.nan, np.nan)
+
+    def baseline(pair, mode):
+        early, late = pair
+        if not np.isfinite(early):
+            return nanline.copy()
+        if mode == "early":
+            return np.full(n, early)
+        if mode == "late":
+            return np.full(n, late)
+        # Use an interpolated reference to accommodate tracking drift.
+        # Extrapolation outside the resting windows is not required.
+        x0, x1 = max(0, edge // 2), min(n - 1, n - edge // 2 - 1)
+        return np.interp(idx, [x0, x1], [early, late])
+
+    def simple_score(series):
+        finite = series[np.isfinite(series)]
+        if len(finite) < 8:
+            return 2.0
+        center = np.median(finite)
+        return max(0.8, 1.4826 * float(np.median(np.abs(finite - center))))
+
+    # Hip ascent is a separate movement signal that rejects brief foot-keypoint
+    # noise, mis-tracking and ordinary small steps.
+    hip_early = np.nanmedian(hip[:edge]) if np.isfinite(hip[:edge]).any() else np.nan
+    hip_late = np.nanmedian(hip[-edge:]) if np.isfinite(hip[-edge:]).any() else np.nan
+    if not np.isfinite(hip_early) and np.isfinite(hip_late):
+        hip_early = hip_late
+    if not np.isfinite(hip_late) and np.isfinite(hip_early):
+        hip_late = hip_early
+    if np.isfinite(hip_early):
+        hip_ground = np.interp(idx, [0, n - 1], [hip_early, hip_late])
+        hip_rise_series = hip_ground - hip
+    else:
+        hip_rise_series = nanline.copy()
+
+    all_candidates = []
+    best_plot = None
+    best_plot_score = -1.0
+    for mode in ("drift", "early", "late"):
+        ground_l = baseline(floors["left"], mode)
+        ground_r = baseline(floors["right"], mode)
+        l_clear = ground_l - left
+        r_clear = ground_r - right
+        # Both feet must clear their individual estimated ground references.
+        both = np.minimum(l_clear, r_clear)
+        both[~both_valid] = np.nan
+        local_noise = simple_score(np.r_[both[:edge], both[-edge:]])
+        core_level = max(3.0, 0.013 * scale, 1.9 * local_noise)
+        edge_level = max(1.0, 0.003 * scale, 0.50 * local_noise)
+        edge_level = min(edge_level, core_level * 0.45)
+        airborne = np.isfinite(both) & (both > core_level)
+        ranges = segments(airborne, max(1, int(round(fps * 0.060))))
+        for start, stop in ranges:
+            if stop - start < max(3, int(round(fps * 0.105))):
+                continue
+            takeoff = int(start)
+            landing = int(stop)
+            bound_l = max(1, takeoff - int(round(fps * 0.25)))
+            bound_r = min(n - 2, landing + int(round(fps * 0.25)))
+            while (takeoff > bound_l and np.isfinite(both[takeoff - 1])
+                   and both[takeoff - 1] > edge_level):
+                takeoff -= 1
+            while (landing < bound_r and np.isfinite(both[landing])
+                   and both[landing] > edge_level):
+                landing += 1
+            if takeoff < 2 or landing >= n - 2:
+                continue
+            flight = float(times[landing] - times[takeoff])
+            if not 0.18 <= flight <= 1.20:
+                continue
+            coverage = float(raw_joint_valid[takeoff:landing + 1].mean())
+            if coverage < 0.50:
+                continue
+            pre_hip = hip[max(0, takeoff - round(fps * 0.13)):takeoff]
+            mid_hip = hip[takeoff:landing + 1]
+            pre_hip, mid_hip = pre_hip[np.isfinite(pre_hip)], mid_hip[np.isfinite(mid_hip)]
+            if len(pre_hip) < 2 or len(mid_hip) < 4:
+                continue
+            hip_rise = float(np.median(pre_hip) - np.percentile(mid_hip, 12))
+            if hip_rise < max(5, scale * 0.042):
+                continue
+            peak_idx = takeoff + int(np.nanargmin(hip[takeoff:landing + 1]))
+            if not (takeoff + max(2, round(fps * 0.045)) <= peak_idx
+                    <= landing - max(2, round(fps * 0.045))):
+                continue
+            before = both[max(0, takeoff - round(fps * 0.12)):takeoff]
+            after = both[landing + 1:min(n, landing + 1 + round(fps * 0.12))]
+            if (np.sum(np.isfinite(before) & (before < core_level)) < 2 or
+                    np.sum(np.isfinite(after) & (after < core_level)) < 2):
+                continue
+            peak_clearance = float(np.nanpercentile(both[start:stop], 90))
+            confidence = (
+                0.28 * min(1.0, peak_clearance / (core_level * 3.0)) +
+                0.30 * min(1.0, hip_rise / max(10, 0.14 * scale)) +
+                0.25 * coverage +
+                0.17 * max(0.0, 1.0 - abs(peak_idx - (takeoff + landing) / 2) /
+                            max(1, (landing - takeoff) / 2))
+            )
+            # Prefer adaptive ground for an equivalent physical explanation.
+            if mode == "drift":
+                confidence += 0.015
+            all_candidates.append({
+                "score": min(1.0, confidence), "start": takeoff, "end": landing,
+                "left": l_clear.copy(), "right": r_clear.copy(), "both": both.copy(),
+                "ground_left": float(ground_l[takeoff]),
+                "ground_right": float(ground_r[takeoff]),
+                "mode": mode, "coverage": coverage,
+            })
+        # Even on failure, show the adjusted ground-distance series for review.
+        valid_count = np.isfinite(both).sum()
+        # Prefer adaptive floor for plotting when enough data is available.
+        plot_score = valid_count + (n if mode == "drift" else 0)
+        if plot_score > best_plot_score:
+            best_plot_score = plot_score
+            best_plot = (l_clear, r_clear, both, ground_l, ground_r)
+
+    out["candidates"] = len(all_candidates)
+    if best_plot is not None:
+        out["left"], out["right"], out["both"] = best_plot[:3]
+        out["ground_left"] = float(np.nanmedian(best_plot[3])) if np.isfinite(best_plot[3]).any() else np.nan
+        out["ground_right"] = float(np.nanmedian(best_plot[4])) if np.isfinite(best_plot[4]).any() else np.nan
+
+    if all_candidates:
+        best = max(all_candidates, key=lambda x: x["score"])
+        out.update({
+            "takeoff": best["start"], "landing": best["end"],
+            "left": best["left"], "right": best["right"], "both": best["both"],
+            "ground_left": best["ground_left"], "ground_right": best["ground_right"],
+            "score": round(float(best["score"]), 3),
+            "method": "両足の接地変化＋腰の上下動",
+            "quality": "要確認" if best["score"] < 0.80 else "比較的安定（要画像確認）",
+            "reason": ("両足の足先位置を補正したうえで、腰の上昇と一致する滞空区間を提案しました。"
+                       "接地そのものは判定できないため、必ず離地・着地の画像を確認してください。"),
+        })
         return out
-    out["ground_left"], out["ground_right"] = gl, gr
-    lc, rc = gl - left, gr - right
-    both = np.minimum(lc, rc)   # Both feet must be in the air.
-    both[~good] = np.nan
-    out["left"], out["right"], out["both"], out["hip"] = lc, rc, both, hip
 
-    # Thresholds adapt to body size and noise. Boundary is intentionally
-    # much closer to the floor than the reliable middle of the flight.
-    contacts = np.r_[both[:edge], both[-edge:]]
-    contacts = contacts[np.isfinite(contacts)]
-    noise = float(1.4826 * np.median(np.abs(contacts - np.median(contacts)))) if len(contacts) >= 8 else 2.0
-    core_level = max(4.0, scale * 0.018, noise * 2.2)
-    edge_level = max(1.5, scale * 0.004, noise * 0.75)
-    if edge_level >= core_level:
-        edge_level = core_level * 0.45
-
-    core = np.isfinite(both) & (both > core_level)
-    ranges = segments(core, max(1, int(round(fps * 0.035))))
-    candidates = []
-    for start, end in ranges:
-        if end - start < max(2, round(fps * 0.070)):
-            continue
-        # Extend to earliest/later near-floor crossing; not just center of arc.
-        takeoff = start
-        limit_left = max(1, start - int(round(fps * 0.24)))
-        while (takeoff > limit_left and np.isfinite(both[takeoff - 1])
-               and both[takeoff - 1] > edge_level):
-            takeoff -= 1
-        landing = end
-        limit_right = min(n - 2, end + int(round(fps * 0.24)))
-        while (landing < limit_right and np.isfinite(both[landing])
-               and both[landing] > edge_level):
-            landing += 1
-        if takeoff < 2 or landing > n - 3:
-            continue
-        flight = float(times[landing] - times[takeoff])
-        if not 0.16 <= flight <= 1.30:
-            continue
-        valid_section = float(np.mean(good[takeoff:landing + 1]))
-        if valid_section < 0.78:
-            continue
-        # A genuine jump should raise the pelvis during the airborne phase.
-        pre = hip[max(0, takeoff - max(3, round(fps * 0.12))):takeoff]
-        air = hip[takeoff:landing]
-        pre = pre[np.isfinite(pre)]
-        air = air[np.isfinite(air)]
-        if len(pre) < 2 or len(air) < 3:
-            continue
-        hip_rise = float(np.median(pre) - np.percentile(air, 12))
-        if hip_rise < max(5.0, 0.04 * scale):
-            continue
-        peak_clearance = float(np.nanmax(both[start:end]))
-        # Require contact-like samples on both sides, not a mid-video crop.
-        before = both[max(0, takeoff - round(fps * 0.18)):takeoff]
-        after = both[landing + 1:min(n, landing + 1 + round(fps * 0.18))]
-        if (np.sum(np.isfinite(before) & (before < core_level)) < 2
-                or np.sum(np.isfinite(after) & (after < core_level)) < 2):
-            continue
-        quality_score = (
-            0.30 * min(1.0, peak_clearance / (core_level * 3.0))
-            + 0.35 * min(1.0, hip_rise / (scale * 0.18))
-            + 0.35 * valid_section
-        )
-        candidates.append((quality_score, peak_clearance, takeoff, landing))
-
-    out["candidates"] = len(candidates)
-    if not candidates:
-        out["reason"] = (
-            "離地・着地を安全に自動判定できませんでした。"
-            "撮影条件を確認し、下のフレーム確認から手動指定してください。"
-        )
-        return out
-    best = max(candidates, key=lambda item: (item[0], item[1]))
-    out["takeoff"], out["landing"] = int(best[2]), int(best[3])
-    out["quality"] = "要確認" if best[0] < 0.83 or out["coverage"] < 0.90 else "比較的安定"
-    out["reason"] = "自動推定です。離地・着地のフレームを必ず確認してください。"
+    # If feet are occluded or foot tracking drifts, a conservative hip-only
+    # alternative is more helpful than silently defaulting to 1/3 and 2/3 of
+    # a video. It is explicitly labelled LOW confidence and MUST be reviewed.
+    finite_rise = np.isfinite(hip_rise_series)
+    if finite_rise.mean() >= 0.60:
+        central = hip_rise_series[edge:n-edge]
+        if len(central) >= 10 and np.isfinite(central).any():
+            peak_index = edge + int(np.nanargmax(central))
+            peak_rise = float(hip_rise_series[peak_index])
+            min_rise = max(9.0, 0.065 * scale)
+            if peak_rise >= min_rise:
+                # At flight apex pelvis height is near a maximum; the 20%
+                # crossings produce only an approximate airborne interval.
+                threshold = max(3.0, peak_rise * 0.20)
+                left_idx = peak_index
+                right_idx = peak_index
+                while (left_idx > 1 and np.isfinite(hip_rise_series[left_idx-1])
+                       and hip_rise_series[left_idx-1] > threshold):
+                    left_idx -= 1
+                while (right_idx < n-2 and np.isfinite(hip_rise_series[right_idx+1])
+                       and hip_rise_series[right_idx+1] > threshold):
+                    right_idx += 1
+                length_s = float(times[right_idx] - times[left_idx])
+                # Foot movement must accompany pelvis rise; don't infer
+                # a jump from a standing person's noisy hip landmark alone.
+                foot_motion = 0.0
+                for track in (left, right):
+                    portion = track[left_idx:right_idx+1]
+                    portion = portion[np.isfinite(portion)]
+                    if len(portion) >= 5:
+                        foot_motion = max(foot_motion, float(np.percentile(portion, 85)
+                                                              - np.percentile(portion, 15)))
+                if (left_idx >= 2 and right_idx <= n-3 and
+                        0.25 <= length_s <= 1.1 and foot_motion >= max(4, 0.017 * scale)):
+                    out.update({
+                        "takeoff": int(left_idx), "landing": int(right_idx),
+                        "quality": "低信頼・手動修正を推奨",
+                        "method": "腰の上下動からの参考候補",
+                        "score": None,
+                        "reason": ("足元だけでは接地を判定できなかったため、腰が最も上がった区間から"
+                                   "参考フレームを提示しています。誤差が大きい可能性があるため、"
+                                   "離地・着地フレームを手動で修正してください。"),
+                    })
+                    return out
+    out["reason"] = (
+        "接地の変化と腰の上昇が十分に一致しませんでした。"
+        "足先が画面内にあるか、カメラが固定されているかを確認し、"
+        "離地・着地フレームを手動で指定してください。"
+    )
     return out
+
 
 
 def to_preview_jpeg(frame, max_side=400):
@@ -777,8 +910,9 @@ def result_warning(flight, history):
 
 
 def invalidate_review():
-    """Changing a proposed event frame requires confirmation again."""
+    """Changing either event frame requires confirmation again."""
     st.session_state["review_confirmed"] = False
+    st.session_state["manual_frames_changed"] = True
 
 
 def frame_preview(label, result, frame_number):
@@ -805,7 +939,7 @@ def render_measure_tab(athlete_id, history):
         st.session_state["active_video_hash"] = video_hash
         st.session_state["analysis"] = None
         st.session_state["last_saved_measurement"] = None
-        for k in ("takeoff_input", "landing_input", "review_confirmed"):
+        for k in ("takeoff_input", "landing_input", "review_confirmed", "manual_frames_changed"):
             st.session_state.pop(k, None)
     st.caption(f"{video.name}（{len(video_bytes)/1048576:.1f} MB）")
     with st.expander("📋 アップロードされた動画のFPSを診断"):
@@ -887,6 +1021,7 @@ def render_measure_tab(athlete_id, history):
             st.session_state["takeoff_input"] = int(start)
             st.session_state["landing_input"] = int(end)
             st.session_state["review_confirmed"] = False
+            st.session_state["manual_frames_changed"] = False
             st.session_state["last_saved_measurement"] = None
             status.empty()
             progress.empty()
@@ -922,11 +1057,15 @@ def render_measure_tab(athlete_id, history):
     if fps < 60:
         st.warning("60fps未満の動画はフレーム誤差が大きいため、結果の解釈に注意してください。")
     if pred["takeoff"] is None:
-        st.warning("自動検出に失敗しました。開始・終了フレームを目視で選択してください。現在の数字は仮置きです。")
+        if st.session_state.get("manual_frames_changed", False):
+            st.info("自動検出は成立しませんでしたが、現在の離地・着地フレームは手動指定されたものです。")
+        else:
+            st.warning("自動検出に失敗しました。現在の数字は仮置きです。離地・着地フレームを選択してください。")
         st.caption(pred["reason"])
     else:
         candidate_seconds = float(result["times"][pred["landing"]] - result["times"][pred["takeoff"]])
-        st.info(f"AIの参考値：{height_cm(candidate_seconds):.1f} cm ｜ 滞空 {candidate_seconds:.3f} 秒 ｜ {pred['quality']}")
+        st.info(f"AIの参考候補：{height_cm(candidate_seconds):.1f} cm ｜ 滞空 {candidate_seconds:.3f} 秒 ｜ {pred['quality']}")
+        st.caption(f"判定の根拠：{pred.get('method', '骨格位置の変化')}。{pred['reason']}")
     st.video(result["video_h264"], format="video/mp4")
     st.download_button("骨格付き動画をダウンロード", result["video_h264"],
                        file_name="jump_with_skeleton.mp4", mime="video/mp4")
@@ -954,7 +1093,12 @@ def render_measure_tab(athlete_id, history):
     k3.metric("判定フレーム差", f"{int(landing) - int(takeoff)}")
     result_warning(flight, history)
     if pred["takeoff"] is None:
-        st.warning("自動検出できていないため、この値は仮設定したフレームから計算した値です。必ず修正してください。")
+        if st.session_state.get("manual_frames_changed", False):
+            st.info("手動で指定した離地・着地フレームから計算した参考値です。画像の確認を続けてください。")
+        else:
+            st.warning("自動検出できていないため、現在のフレームは仮設定です。離地・着地を手動で修正してください。")
+    elif pred.get("quality", "").startswith("低信頼") and not st.session_state.get("manual_frames_changed", False):
+        st.warning("この候補は腰の動きからの推定で、離地・着地と一致する保証はありません。必ず手動で確認・修正してください。")
     st.caption("計算式：h = 9.81 × t² / 8。離地と着地の身体重心の高さが同じ場合の近似です。")
     st.caption(f"時刻計算：{result['time_source']}。平均FPSと実際の撮影間隔が違う動画では誤差が生じます。")
     with st.expander("解析データを見る（検証用）"):
