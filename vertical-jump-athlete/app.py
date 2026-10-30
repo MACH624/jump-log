@@ -93,6 +93,130 @@ def pose_features(pose_result, frame_height):
     return sole(FOOT_IDS[0]), sole(FOOT_IDS[1]), hip_y, scale
 
 
+def ankle_y_features(pose_result, frame_height):
+    """MediaPipe's left/right ANKLE y (27, 28); unavailable -> NaN."""
+    if not pose_result.pose_landmarks:
+        return np.nan, np.nan
+    pts = pose_result.pose_landmarks.landmark
+    return tuple(
+        float(pts[j].y * frame_height) if
+        np.isfinite(pts[j].y) and pts[j].visibility >= 0.45 else np.nan
+        for j in (27, 28)
+    )
+
+
+def detect_ankle_only(left_y_raw, right_y_raw, fps, times):
+    """Experimental two-ankle airborne *candidate* estimator, not contact truth.
+
+    Only MediaPipe landmark 27/28 y positions are used. Does not use a manually
+    annotated jump or reference height as an input (avoids answer leakage).
+    """
+    left_y_raw = np.asarray(left_y_raw, dtype=float)
+    right_y_raw = np.asarray(right_y_raw, dtype=float)
+    times = np.asarray(times, dtype=float)
+    n = len(left_y_raw)
+    blank = np.full(n, np.nan)
+    out = dict(takeoff=None, landing=None, quality="候補なし", reason="",
+               method="左右足首のみ（実験版）", left=blank.copy(),
+               right=blank.copy(), both=blank.copy(), hip=blank.copy(),
+               coverage=0.0, candidates=0, score=None,
+               left_y=blank.copy(), right_y=blank.copy(),
+               baseline_left=np.nan, baseline_right=np.nan)
+    if (n < 25 or len(right_y_raw) != n or len(times) != n or
+            not np.all(np.isfinite(times)) or np.any(np.diff(times) <= 0) or
+            not np.isfinite(fps) or fps < 1):
+        out["reason"] = "フレーム時刻または長さが不足しています。"
+        return out
+    good_raw = np.isfinite(left_y_raw) & np.isfinite(right_y_raw)
+    out["coverage"] = float(good_raw.mean())
+    if out["coverage"] < 0.40:
+        out["reason"] = "左右足首が同時に見えるフレームが40%未満です。"
+        return out
+    left = smooth_series(left_y_raw, fps)
+    right = smooth_series(right_y_raw, fps)
+    out["left_y"], out["right_y"] = left, right
+    # The front/back resting intervals provide a level and a rough noise size.
+    # The camera should stay fixed, with 0.5-1s of rest before/after jump.
+    edge = max(6, min(n // 5, int(round(fps * 0.65))))
+    idx = np.arange(n, dtype=float)
+    clearances = []
+    noises = []
+    for series in (left, right):
+        pre = series[:edge]
+        post = series[-edge:]
+        pre = pre[np.isfinite(pre)]
+        post = post[np.isfinite(post)]
+        if len(pre) < 4 or len(post) < 4:
+            out["reason"] = "動画の前後に静止した足首のフレームが不足しています。"
+            return out
+        # y increases downwards: standing ankle y is approximately constant.
+        a, b = float(np.median(pre)), float(np.median(post))
+        baseline = np.interp(idx, [0, n - 1], [a, b])
+        clearance = baseline - series
+        clearances.append(clearance)
+        noise = 1.4826 * float(np.median(np.abs(np.r_[pre - a, post - b])))
+        noises.append(max(1.0, noise))
+    out["baseline_left"] = float(np.median(np.r_[left[:edge]]))
+    out["baseline_right"] = float(np.median(np.r_[right[:edge]]))
+    l_clear, r_clear = clearances
+    joint = np.minimum(l_clear, r_clear)
+    joint[~(np.isfinite(left) & np.isfinite(right))] = np.nan
+    out["left"], out["right"], out["both"] = l_clear, r_clear, joint
+    if np.isfinite(joint).mean() < 0.50:
+        out["reason"] = "補間後も左右足首を同時に追跡できません。"
+        return out
+    # A low threshold approximates the ankle leaving/returning to baseline;
+    # a separate high core threshold rejects short foot wobbles.
+    noise = max(noises)
+    low = max(2.0, 1.7 * noise)
+    high = max(6.0, 3.0 * noise)
+    if high <= low: high = low * 1.7
+    mask = np.isfinite(joint) & (joint >= high)
+    runs = segments(mask, max(1, round(fps * 0.045)))
+    options = []
+    for start, stop in runs:
+        if stop - start < max(3, int(round(fps * 0.090))):
+            continue
+        a, b = int(start), int(min(n - 1, stop))
+        # Extend core to first up-cross and first down-cross of low threshold.
+        search = max(3, int(round(fps * 0.25)))
+        for _ in range(search):
+            if a <= 0 or not np.isfinite(joint[a - 1]) or joint[a - 1] < low:
+                break
+            a -= 1
+        for _ in range(search):
+            if b >= n - 1 or not np.isfinite(joint[b]) or joint[b] < low:
+                break
+            b += 1
+        if a < 2 or b >= n - 2:
+            continue
+        flight = float(times[b] - times[a])
+        if not 0.16 <= flight <= 1.30:
+            continue
+        region = joint[a:b+1]
+        if np.isfinite(region).mean() < 0.65:
+            continue
+        peak = float(np.nanpercentile(region, 90))
+        if peak < high * 1.2:
+            continue
+        # Prefer strong sustained, coherent airborne trajectories.
+        core_fraction = float(np.mean(region >= high))
+        quality = peak * min(1, core_fraction + 0.35)
+        options.append((quality, a, b, peak))
+    out["candidates"] = len(options)
+    if not options:
+        out["reason"] = (
+            "左右足首が同時に基準位置から上昇し、戻る区間を確定できませんでした。"
+            "撮影前後の静止・足首の可視性・グラフを確認してください。")
+        return out
+    quality, a, b, peak = max(options)
+    out.update(takeoff=int(a), landing=int(b),
+               quality="参考候補（要目視確認）",
+               reason=f"両足首の上昇・下降から候補を推定。ピーク上昇 {peak:.1f}px。接地は直接測っていません。",
+               score=float(quality))
+    return out
+
+
 def segments(mask, gap_frames):
     """Contiguous true regions with short false gaps bridged."""
     m = np.asarray(mask, dtype=bool).copy()
@@ -607,6 +731,7 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
             if not writer.isOpened():
                 raise RuntimeError("骨格付き動画の保存を開始できませんでした。")
             props = [[], [], [], []]
+            ankle_props = [[], []]
             timestamps_ms = []
             frames_jpeg = []
             landmark_count = 0
@@ -626,6 +751,8 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
                     rgb.flags.writeable = True
                     features = pose_features(result, h)
                     for column, val in zip(props, features):
+                        column.append(val)
+                    for column, val in zip(ankle_props, ankle_y_features(result, h)):
                         column.append(val)
                     timestamps_ms.append(float(cap.get(cv2.CAP_PROP_POS_MSEC)))
                     if result.pose_landmarks:
@@ -673,7 +800,10 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
                 times = np.arange(n, dtype=float) / fps
                 time_source = "FPS換算（近似）"
             display_progress.progress(0.90)
-            prediction = detect_events(*props, fps, times)
+            legacy_prediction = detect_events(*props, fps, times)
+            ankle_prediction = detect_ankle_only(*ankle_props, fps, times)
+            prediction = (ankle_prediction if ankle_prediction["takeoff"] is not None
+                          else legacy_prediction)
             command = [
                 imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
                 "-y", "-i", str(raw_output), "-c:v", "libx264", "-preset", "veryfast",
@@ -689,7 +819,9 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
                 "ffprobe_fps": probed_fps, "ffprobe_error": probe_info["error"],
                 "fps_override": capture_fps_override, "frames": n, "times": times,
                 "time_source": time_source, "pose_coverage": landmark_count / n,
-                "prediction": prediction, "preview_frames": frames_jpeg,
+                "prediction": prediction, "legacy_prediction": legacy_prediction,
+                "ankle_prediction": ankle_prediction,
+                "raw_ankles": ankle_props, "preview_frames": frames_jpeg,
                 "video_h264": h264_output.read_bytes(), "resolution": (w, h),
                 "duration": float(times[-1]) if n else 0.0,
             }
@@ -912,6 +1044,7 @@ def result_warning(flight, history):
 def invalidate_review():
     """Changing either event frame requires confirmation again."""
     st.session_state["review_confirmed"] = False
+    st.session_state["eval_reference_confirmed"] = False
     st.session_state["manual_frames_changed"] = True
 
 
@@ -939,7 +1072,7 @@ def render_measure_tab(athlete_id, history):
         st.session_state["active_video_hash"] = video_hash
         st.session_state["analysis"] = None
         st.session_state["last_saved_measurement"] = None
-        for k in ("takeoff_input", "landing_input", "review_confirmed", "manual_frames_changed"):
+        for k in ("takeoff_input", "landing_input", "review_confirmed", "manual_frames_changed", "eval_reference_confirmed"):
             st.session_state.pop(k, None)
     st.caption(f"{video.name}（{len(video_bytes)/1048576:.1f} MB）")
     with st.expander("📋 アップロードされた動画のFPSを診断"):
@@ -1022,6 +1155,7 @@ def render_measure_tab(athlete_id, history):
             st.session_state["landing_input"] = int(end)
             st.session_state["review_confirmed"] = False
             st.session_state["manual_frames_changed"] = False
+            st.session_state["eval_reference_confirmed"] = False
             st.session_state["last_saved_measurement"] = None
             status.empty()
             progress.empty()
@@ -1066,6 +1200,25 @@ def render_measure_tab(athlete_id, history):
         candidate_seconds = float(result["times"][pred["landing"]] - result["times"][pred["takeoff"]])
         st.info(f"AIの参考候補：{height_cm(candidate_seconds):.1f} cm ｜ 滞空 {candidate_seconds:.3f} 秒 ｜ {pred['quality']}")
         st.caption(f"判定の根拠：{pred.get('method', '骨格位置の変化')}。{pred['reason']}")
+    ankle = result.get("ankle_prediction", {})
+    with st.expander("🦶 足首のみの自動検出（実験版）", expanded=True):
+        st.caption("MediaPipe 27番・28番の左右足首Y座標だけを使います。腰・足先・手動の基準値は判定に使用しません。")
+        st.write(f"両足首の元データ検出率：{100 * ankle.get('coverage', 0):.1f}%")
+        if ankle.get("takeoff") is not None:
+            an_a, an_b = ankle["takeoff"], ankle["landing"]
+            ankle_dt = float(result["times"][an_b] - result["times"][an_a])
+            st.write(f"自動候補：離地 **{an_a}** / 着地 **{an_b}**（{an_b - an_a}フレーム差）")
+            st.write(f"参考値：滞空 {ankle_dt:.3f}秒、跳躍高 {height_cm(ankle_dt):.1f}cm")
+        else:
+            st.warning("足首のみの自動候補は作成できませんでした。" + ankle.get("reason", ""))
+        ankle_chart = pd.DataFrame({
+            "左足首の基準からの上昇(px)": ankle.get("left"),
+            "右足首の基準からの上昇(px)": ankle.get("right"),
+            "両足同時の上昇(px)": ankle.get("both"),
+        }, index=np.asarray(result["times"]))
+        ankle_chart.index.name = "動画時刻（秒）"
+        st.line_chart(ankle_chart)
+        st.caption("線は足首の推定移動量です。床との実距離ではありません。")
     st.video(result["video_h264"], format="video/mp4")
     st.download_button("骨格付き動画をダウンロード", result["video_h264"],
                        file_name="jump_with_skeleton.mp4", mime="video/mp4")
@@ -1101,6 +1254,58 @@ def render_measure_tab(athlete_id, history):
         st.warning("この候補は腰の動きからの推定で、離地・着地と一致する保証はありません。必ず手動で確認・修正してください。")
     st.caption("計算式：h = 9.81 × t² / 8。離地と着地の身体重心の高さが同じ場合の近似です。")
     st.caption(f"時刻計算：{result['time_source']}。平均FPSと実際の撮影間隔が違う動画では誤差が生じます。")
+    with st.expander("🔬 卒業研究用：足首自動検出と手動基準の比較", expanded=True):
+        st.info("まず上の離地・着地を自分の目で選び直してください。手動で確認した値を基準にし、自動検出結果とは別に比較します。")
+        ankle = result.get("ankle_prediction", {})
+        st.write(f"手動基準：離地 **{int(takeoff)}** / 着地 **{int(landing)}**（{int(landing)-int(takeoff)}フレーム差）")
+        valid_auto = ankle.get("takeoff") is not None and ankle.get("landing") is not None
+        if valid_auto:
+            auto_a = int(ankle["takeoff"])
+            auto_b = int(ankle["landing"])
+            auto_t = float(result["times"][auto_b] - result["times"][auto_a])
+            takeoff_error = auto_a - int(takeoff)
+            landing_error = auto_b - int(landing)
+            t_error = auto_t - flight
+            h_error = height_cm(auto_t) - jump
+            st.write(f"自動候補：離地 **{auto_a}** / 着地 **{auto_b}**（{auto_b-auto_a}フレーム差）")
+            a1, a2 = st.columns(2)
+            a1.metric("離地誤差（自動−手動）", f"{takeoff_error:+d} フレーム")
+            a2.metric("着地誤差（自動−手動）", f"{landing_error:+d} フレーム")
+            b1, b2 = st.columns(2)
+            b1.metric("滞空時間の差", f"{t_error * 1000:+.1f} ms")
+            b2.metric("跳躍高の差", f"{h_error:+.2f} cm")
+        else:
+            auto_a = auto_b = None
+            auto_t = takeoff_error = landing_error = t_error = h_error = np.nan
+            st.warning("足首自動検出が失敗しました。CSVには『検出失敗』として残します。手動結果との差は計算できません。")
+        agreed = st.checkbox("離地・着地の2画像を目視確認し、手動基準として記録する", key="eval_reference_confirmed")
+        if agreed:
+            evaluation = pd.DataFrame([{
+                "video_name": video.name,
+                "video_sha256": video_hash,
+                "method": "ankles_27_28_only_v3",
+                "fps_reported": fps,
+                "time_source": result["time_source"],
+                "total_frames": n,
+                "auto_success": int(valid_auto),
+                "manual_takeoff_frame": int(takeoff),
+                "manual_landing_frame": int(landing),
+                "manual_flight_seconds": round(flight, 8),
+                "manual_jump_cm": round(jump, 5),
+                "auto_takeoff_frame": auto_a,
+                "auto_landing_frame": auto_b,
+                "auto_flight_seconds": round(auto_t, 8) if valid_auto else np.nan,
+                "auto_jump_cm": round(height_cm(auto_t), 5) if valid_auto else np.nan,
+                "takeoff_error_frames": takeoff_error,
+                "landing_error_frames": landing_error,
+                "flight_error_seconds": round(t_error, 8) if valid_auto else np.nan,
+                "height_error_cm": round(h_error, 5) if valid_auto else np.nan,
+                "absolute_height_error_cm": round(abs(h_error), 5) if valid_auto else np.nan,
+            }])
+            st.download_button("比較結果をCSVで保存", evaluation.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"jump_eval_{video_hash[:8]}.csv", mime="text/csv", key="download_ankle_evaluation")
+            st.caption("複数動画の比較CSVを集めれば、検出成功率・フレーム誤差・平均絶対誤差（MAE）を集計できます。")
+
     with st.expander("解析データを見る（検証用）"):
         px = pred["both"]
         if np.isfinite(px).any():
@@ -1110,7 +1315,10 @@ def render_measure_tab(athlete_id, history):
         csv_data = pd.DataFrame({
             "frame": np.arange(n), "time_s": result["times"],
             "left_clearance_px": pred["left"], "right_clearance_px": pred["right"],
-            "both_clearance_px": pred["both"], "hip_y_px": pred["hip"]
+            "both_clearance_px": pred["both"], "hip_y_px": pred["hip"],
+            "left_ankle_y_px": result.get("raw_ankles", [[], []])[0],
+            "right_ankle_y_px": result.get("raw_ankles", [[], []])[1],
+            "ankle_both_clearance_px": result.get("ankle_prediction", {}).get("both"),
         }).to_csv(index=False).encode("utf-8-sig")
         st.download_button("解析CSVを保存", csv_data, file_name="jump_landmarks.csv", mime="text/csv")
     st.divider()
