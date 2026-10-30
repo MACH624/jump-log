@@ -4,6 +4,8 @@ Dependencies: streamlit==1.40.1, mediapipe==0.10.21,
 opencv-python-headless==4.11.0.86, numpy==1.26.4, imageio-ffmpeg, pandas.
 """
 import hashlib
+import json
+from fractions import Fraction
 import uuid
 import sqlite3
 import subprocess
@@ -359,6 +361,73 @@ class PoseProcessor:
         return SimpleNamespace(pose_landmarks=landmarks)
 
 
+def _fraction_fps(text):
+    try:
+        value = float(Fraction(str(text)))
+    except (ValueError, TypeError, ZeroDivisionError):
+        return None
+    return value if np.isfinite(value) and 1 < value <= 500 else None
+
+
+def inspect_video_fps(path, read_frame_times=False):
+    """Read FPS from the actual uploaded file, independently of OpenCV.
+
+    FFprobe uses the video stream metadata, while OpenCV CAP_PROP_FPS can
+    disagree for some phone files. Frame timestamps are preferred for VFR.
+    """
+    info = {"fps": None, "frame_times": None, "frames": None,
+            "duration": None, "error": ""}
+    binary = shutil.which("ffprobe")
+    if not binary:
+        info["error"] = "ffprobeが見つかりません。Cloudのpackages.txtにffmpegを追加してください。"
+        return info
+    cmd = [binary, "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration",
+           "-of", "json", str(path)]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        if res.returncode != 0:
+            info["error"] = res.stderr[-300:]
+            return info
+        doc = json.loads(res.stdout)
+        streams = doc.get("streams") or []
+        if not streams:
+            info["error"] = "映像ストリームが見つかりません。"
+            return info
+        stream = streams[0]
+        info["fps"] = _fraction_fps(stream.get("avg_frame_rate"))
+        try:
+            info["frames"] = int(stream["nb_frames"])
+        except (KeyError, ValueError, TypeError):
+            pass
+        try:
+            info["duration"] = float(stream.get("duration") or doc.get("format", {}).get("duration"))
+        except (ValueError, TypeError):
+            pass
+        if info["fps"] is None and info["frames"] and info["duration"] and info["duration"] > 0:
+            trial = info["frames"] / info["duration"]
+            info["fps"] = trial if 1 < trial <= 500 else None
+        if read_frame_times:
+            pts_cmd = [binary, "-v", "error", "-select_streams", "v:0",
+                       "-show_entries", "frame=best_effort_timestamp_time",
+                       "-of", "csv=p=0", str(path)]
+            pts_res = subprocess.run(pts_cmd, capture_output=True, text=True, timeout=120)
+            if pts_res.returncode == 0:
+                pts = []
+                for line in pts_res.stdout.splitlines():
+                    try:
+                        pts.append(float(line.strip().split(',')[0]))
+                    except (TypeError, ValueError):
+                        continue
+                if len(pts) >= 10:
+                    arr = np.asarray(pts, dtype=float)
+                    if np.all(np.isfinite(arr)) and np.all(np.diff(arr) > 0):
+                        info["frame_times"] = arr - arr[0]
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        info["error"] = str(exc)[:250]
+    return info
+
+
 def analyze_video(video_bytes, suffix, model_complexity, display_progress, capture_fps_override=None):
     """Run every frame with MediaPipe; output review JPGs and H264 MP4."""
     cap = None
@@ -376,8 +445,13 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
             # OpenCV reports the *playback* FPS stored in the file, not
             # necessarily the camera's capture FPS (e.g. iPhone slow-motion).
             source_fps = float(cap.get(cv2.CAP_PROP_FPS))
+            probe_info = inspect_video_fps(raw_input)
+            probed_fps = probe_info["fps"]
             if capture_fps_override is not None:
                 fps = float(capture_fps_override)
+            elif probed_fps is not None:
+                # FFprobe reads metadata of the exact bytes received on Cloud.
+                fps = float(probed_fps)
             else:
                 fps = source_fps
             if not np.isfinite(fps) or fps <= 1 or fps > 500:
@@ -442,7 +516,11 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
             n = len(frames_jpeg)
             if n < 10:
                 raise RuntimeError("動画のフレームが不足しています。")
-            # Prefer actual timestamps if available and consistent; otherwise CFR.
+            # Frame presentation timestamps are most accurate for VFR footage.
+            # In particular, they prevent OpenCV's inaccurate 30fps value
+            # from changing the duration of genuine 119.94fps material.
+            full_probe = inspect_video_fps(raw_input, read_frame_times=True)
+            probe_times = full_probe.get("frame_times")
             pos = np.asarray(timestamps_ms, dtype=float) / 1000.0
             dt = np.diff(pos)
             # A deliberate high-FPS override means the file is a uniformly
@@ -451,6 +529,9 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
             if capture_fps_override is not None:
                 times = np.arange(n, dtype=float) / fps
                 time_source = f"撮影時FPS {fps:g}で再計算（手動指定）"
+            elif probe_times is not None and len(probe_times) == n:
+                times = probe_times
+                time_source = "FFprobeのフレーム時刻（元動画）"
             elif (np.all(np.isfinite(pos)) and len(dt)
                     and np.all(dt > 0) and 0.5 / fps <= float(np.median(dt)) <= 2.0 / fps):
                 times = pos - pos[0]
@@ -472,6 +553,7 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
             display_progress.progress(1.0)
             return {
                 "fps": fps, "source_fps": source_fps,
+                "ffprobe_fps": probed_fps, "ffprobe_error": probe_info["error"],
                 "fps_override": capture_fps_override, "frames": n, "times": times,
                 "time_source": time_source, "pose_coverage": landmark_count / n,
                 "prediction": prediction, "preview_frames": frames_jpeg,
@@ -726,6 +808,35 @@ def render_measure_tab(athlete_id, history):
         for k in ("takeoff_input", "landing_input", "review_confirmed"):
             st.session_state.pop(k, None)
     st.caption(f"{video.name}（{len(video_bytes)/1048576:.1f} MB）")
+    with st.expander("📋 アップロードされた動画のFPSを診断"):
+        st.caption("この診断はスマホからサーバーに届いた動画ファイルそのものを調べます。")
+        if st.button("動画のFPS情報を調べる", key="fps_diagnose"):
+            with tempfile.TemporaryDirectory(prefix="jump_fps_diag_") as diag_dir:
+                diag_suffix = Path(video.name).suffix.lower()
+                if diag_suffix not in [".mp4", ".mov", ".avi"]:
+                    diag_suffix = ".mp4"
+                diag_path = Path(diag_dir) / ("upload" + diag_suffix)
+                diag_path.write_bytes(video_bytes)
+                info = inspect_video_fps(diag_path)
+                cv_cap = cv2.VideoCapture(str(diag_path))
+                try:
+                    cap_fps = float(cv_cap.get(cv2.CAP_PROP_FPS)) if cv_cap.isOpened() else 0.0
+                    cap_frames = int(cv_cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cv_cap.isOpened() else 0
+                finally:
+                    cv_cap.release()
+            st.write(f"OpenCVの認識：{cap_fps:.2f} fps / {cap_frames}フレーム")
+            if info['fps'] is not None:
+                st.write(f"FFprobeの平均FPS：{info['fps']:.3f} fps")
+                if info['frames'] is not None:
+                    st.write(f"動画に記録されたフレーム数：{info['frames']}")
+                if info['duration'] is not None:
+                    st.write(f"記録された再生時間：{info['duration']:.3f}秒")
+                if info['fps'] < 60 and cap_fps < 60:
+                    st.warning("このアップロード動画は30fps前後と認識されています。119.94fpsの元ファイルが別途あるなら、編集・共有時の変換を確認してください。設定だけ119.94に変更しないでください。")
+                elif info['fps'] >= 100 and cap_fps < 60:
+                    st.success("元動画は高FPSですがOpenCVが低く認識しています。AI解析ではFFprobeのFPSとフレーム時刻を優先します。")
+            else:
+                st.warning("FFprobeでFPSを読めませんでした：" + info['error'])
     if Path(video.name).suffix.lower() == ".mp4":
         with st.expander("元動画を確認", expanded=False):
             st.video(video_bytes, format="video/mp4")
@@ -798,7 +909,11 @@ def render_measure_tab(athlete_id, history):
     c2.metric("フレーム数", str(n))
     c3.metric("骨格検出率", f"{result['pose_coverage']*100:.0f}%")
     detected_file_fps = result.get("source_fps", fps)
-    st.caption(f"元ファイルの再生FPS：{detected_file_fps:.2f} / 解析・出力FPS：{fps:.2f}")
+    probe_value = result.get("ffprobe_fps")
+    probe_label = f"{probe_value:.3f}" if probe_value is not None else "取得できず"
+    st.caption(f"OpenCV取得FPS：{detected_file_fps:.2f} / FFprobe元動画FPS：{probe_label} / 解析・出力FPS：{fps:.3f}")
+    if probe_value is None:
+        st.warning("FFprobeで確認できないため、解析FPSはOpenCV値に依存しています。クラウドのpackages.txtにffmpegを追加してください。")
     if result.get("fps_override") is not None:
         st.warning(
             "撮影時FPSを手動で補正した計測値です。動画にそのFPS分の実フレームが"

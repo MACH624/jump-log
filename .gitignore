@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+vertical-jump-athlete/data/
+*.sqlite3
+.env
+.streamlit/secrets.toml
