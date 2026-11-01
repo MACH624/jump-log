@@ -105,115 +105,211 @@ def toe_y_features(pose_result, frame_height):
     )
 
 
-def detect_toe_only(left_y_raw, right_y_raw, fps, times):
-    """Experimental two-toe airborne *candidate* estimator, not contact truth.
+def _toe_signal(values, fps):
+    """Denoise toe y without treating tiny one-frame jitters as a jump.
 
-    Only MediaPipe landmark 31/32 y positions are used. Does not use a manually
-    annotated jump or reference height as an input (avoids answer leakage).
+    The only position inputs are MediaPipe FOOT_INDEX 31/32. A missing foot
+    does not automatically invalidate the other foot's useful motion.
     """
-    left_y_raw = np.asarray(left_y_raw, dtype=float)
-    right_y_raw = np.asarray(right_y_raw, dtype=float)
-    times = np.asarray(times, dtype=float)
-    n = len(left_y_raw)
-    blank = np.full(n, np.nan)
-    out = dict(takeoff=None, landing=None, quality="候補なし", reason="",
-               method="左右つま先のみ（接地推定・要目視確認）", left=blank.copy(),
-               right=blank.copy(), both=blank.copy(), hip=blank.copy(),
-               coverage=0.0, candidates=0, score=None,
-               left_y=blank.copy(), right_y=blank.copy(),
-               baseline_left=np.nan, baseline_right=np.nan)
-    if (n < 25 or len(right_y_raw) != n or len(times) != n or
-            not np.all(np.isfinite(times)) or np.any(np.diff(times) <= 0) or
-            not np.isfinite(fps) or fps < 1):
-        out["reason"] = "フレーム時刻または長さが不足しています。"
+    raw = np.asarray(values, dtype=float)
+    n = len(raw)
+    if n == 0:
+        return raw
+    out = smooth_series(raw, fps)
+    if not np.isfinite(out).any():
         return out
-    good_raw = np.isfinite(left_y_raw) & np.isfinite(right_y_raw)
-    out["coverage"] = float(good_raw.mean())
-    if out["coverage"] < 0.40:
-        out["reason"] = "左右つま先が同時に見えるフレームが40%未満です。"
+    # Smooth around 50ms, independent of whether the source is 30 or 120fps.
+    window = max(3, int(round(fps * 0.050)) | 1)
+    window = min(window, max(3, n // 3 * 2 + 1))
+    ok = np.isfinite(out).astype(float)
+    kern = np.ones(window, dtype=float)
+    numerator = np.convolve(np.nan_to_num(out, nan=0.0), kern, mode='same')
+    denominator = np.convolve(ok, kern, mode='same')
+    cleaned = np.full(n, np.nan, dtype=float)
+    np.divide(numerator, denominator, out=cleaned, where=denominator >= window * 0.35)
+    return cleaned
+
+
+def _fill_for_motion(arr):
+    """Fill missing data ONLY for candidate search; quality tracks real coverage."""
+    a = np.asarray(arr, dtype=float)
+    good = np.isfinite(a)
+    if not good.any():
+        return None
+    x = np.arange(len(a))
+    return np.interp(x, x[good], a[good])
+
+
+def detect_toe_only(left_y_raw, right_y_raw, fps, times):
+    """Always propose review frames using the strongest toe up/down motion.
+
+    Main idea: reject small pre-jump wobble, locate the largest sustained
+    upward displacement, then the return toward the original toe level.
+    The proposed boundaries are motion boundaries, not observed foot contacts.
+    Even insufficient evidence produces an explicitly LOW confidence placeholder,
+    never a falsely labelled successful contact detection.
+    """
+    left_raw = np.asarray(left_y_raw, dtype=float)
+    right_raw = np.asarray(right_y_raw, dtype=float)
+    time = np.asarray(times, dtype=float)
+    n = len(left_raw)
+    empty = np.full(n, np.nan)
+    out = dict(takeoff=None, landing=None, quality='要目視確認',
+               reason='', method='つま先31/32・大きな上下動の開始／終了',
+               left=empty.copy(), right=empty.copy(), both=empty.copy(),
+               hip=empty.copy(), left_y=empty.copy(), right_y=empty.copy(),
+               baseline_left=np.nan, baseline_right=np.nan,
+               coverage=0., candidates=0, score=0.,
+               reliable=False, evidence='不足', movement_px=0.,
+               threshold_px=0., peak_frame=None, used_feet=0)
+    if n < 2:
+        # A video with fewer than 2 frames cannot define any interval.
+        out['reason'] = '解析できるフレームが2枚未満です。動画自体を確認してください。'
         return out
-    left = smooth_series(left_y_raw, fps)
-    right = smooth_series(right_y_raw, fps)
-    out["left_y"], out["right_y"] = left, right
-    # The front/back resting intervals provide a level and a rough noise size.
-    # The camera should stay fixed, with 0.5-1s of rest before/after jump.
-    edge = max(6, min(n // 5, int(round(fps * 0.65))))
-    idx = np.arange(n, dtype=float)
-    clearances = []
-    noises = []
-    for series in (left, right):
-        pre = series[:edge]
-        post = series[-edge:]
+    if len(right_raw) != n or len(time) != n or not np.all(np.isfinite(time)) or np.any(np.diff(time) <= 0):
+        out.update(takeoff=max(0, n//3), landing=min(n-1, max(1, n*2//3)),
+                   reason='時刻情報が不正です。暫定位置のみ表示しています。')
+        return out
+    if not np.isfinite(fps) or fps < 1:
+        fps = float((n-1) / (time[-1]-time[0]))
+    raw_coverage = [float(np.isfinite(x).mean()) for x in (left_raw, right_raw)]
+    out['coverage'] = float(np.mean(raw_coverage))
+    signals = [_toe_signal(left_raw, fps), _toe_signal(right_raw, fps)]
+    out['left_y'], out['right_y'] = signals
+    # Obtain a resting baseline from the first and last ~0.4 sec; when that is
+    # not feasible use the low-movement/low-height envelope of observed values.
+    edge = min(max(3, round(fps * 0.40)), max(3, n // 5))
+    rises = []
+    movement_amplitudes = []
+    noise_estimates = []
+    for i, smooth_y in enumerate(signals):
+        valid = smooth_y[np.isfinite(smooth_y)]
+        if len(valid) < 5:
+            rises.append(np.full(n, np.nan))
+            movement_amplitudes.append(0.)
+            noise_estimates.append(float('inf'))
+            continue
+        pre = smooth_y[:edge]
+        post = smooth_y[-edge:]
         pre = pre[np.isfinite(pre)]
         post = post[np.isfinite(post)]
-        if len(pre) < 4 or len(post) < 4:
-            out["reason"] = "動画の前後に静止したつま先のフレームが不足しています。"
-            return out
-        # y increases downwards: standing toe-tip proxy y is approximately constant.
-        a, b = float(np.median(pre)), float(np.median(post))
-        baseline = np.interp(idx, [0, n - 1], [a, b])
-        clearance = baseline - series
-        clearances.append(clearance)
-        noise = 1.4826 * float(np.median(np.abs(np.r_[pre - a, post - b])))
-        noises.append(max(1.0, noise))
-    out["baseline_left"] = float(np.median(np.r_[left[:edge]]))
-    out["baseline_right"] = float(np.median(np.r_[right[:edge]]))
-    l_clear, r_clear = clearances
-    joint = np.minimum(l_clear, r_clear)
-    joint[~(np.isfinite(left) & np.isfinite(right))] = np.nan
-    out["left"], out["right"], out["both"] = l_clear, r_clear, joint
-    if np.isfinite(joint).mean() < 0.50:
-        out["reason"] = "補間後も左右つま先を同時に追跡できません。"
+        floor_pre = float(np.median(pre)) if len(pre) >= 3 else float(np.percentile(valid, 80))
+        floor_post = float(np.median(post)) if len(post) >= 3 else floor_pre
+        baseline = np.linspace(floor_pre, floor_post, n)
+        movement = baseline - smooth_y  # increasing upward because image y goes down
+        rises.append(movement)
+        finite = movement[np.isfinite(movement)]
+        amp = max(0., float(np.percentile(finite, 97) - np.percentile(finite, 18)))
+        movement_amplitudes.append(amp)
+        rest = np.r_[pre-floor_pre, post-floor_post]
+        rest = rest[np.isfinite(rest)]
+        noise = float(1.4826*np.median(np.abs(rest-np.median(rest)))) if len(rest) >= 3 else 2.
+        noise_estimates.append(max(0.75, noise))
+        if i == 0:
+            out['baseline_left'] = floor_pre
+        else:
+            out['baseline_right'] = floor_pre
+    out['left'], out['right'] = rises
+    eligible = [i for i in range(2) if np.isfinite(rises[i]).sum() >= 5]
+    out['used_feet'] = len(eligible)
+    if not eligible:
+        # 'No detection' is not disguised as a measured jump.
+        a = int(n // 3)
+        b = int(max(a+1, min(n-1, n*2//3)))
+        out.update(takeoff=a, landing=b,
+                   quality='仮候補・座標不足',
+                   reason='つま先座標が取得できていません。動画中央に仮の確認位置を表示します。',
+                   evidence='座標なし')
         return out
-    # A low threshold approximates the toes leaving/returning to baseline;
-    # a separate high core threshold rejects short foot wobbles.
-    noise = max(noises)
-    low = max(2.0, 1.7 * noise)
-    high = max(6.0, 3.0 * noise)
-    if high <= low: high = low * 1.7
-    mask = np.isfinite(joint) & (joint >= high)
-    runs = segments(mask, max(1, round(fps * 0.045)))
-    options = []
-    for start, stop in runs:
-        if stop - start < max(3, int(round(fps * 0.090))):
-            continue
-        a, b = int(start), int(min(n - 1, stop))
-        # Extend core to first up-cross and first down-cross of low threshold.
-        search = max(3, int(round(fps * 0.25)))
-        for _ in range(search):
-            if a <= 0 or not np.isfinite(joint[a - 1]) or joint[a - 1] < low:
-                break
-            a -= 1
-        for _ in range(search):
-            if b >= n - 1 or not np.isfinite(joint[b]) or joint[b] < low:
-                break
-            b += 1
-        if a < 2 or b >= n - 2:
-            continue
-        flight = float(times[b] - times[a])
-        if not 0.16 <= flight <= 1.30:
-            continue
-        region = joint[a:b+1]
-        if np.isfinite(region).mean() < 0.65:
-            continue
-        peak = float(np.nanpercentile(region, 90))
-        if peak < high * 1.2:
-            continue
-        # Prefer strong sustained, coherent airborne trajectories.
-        core_fraction = float(np.mean(region >= high))
-        quality = peak * min(1, core_fraction + 0.35)
-        options.append((quality, a, b, peak))
-    out["candidates"] = len(options)
-    if not options:
-        out["reason"] = (
-            "左右つま先が同時に基準位置から上昇し、戻る区間を確定できませんでした。"
-            "撮影前後の静止・つま先の可視性・グラフを確認してください。")
+    # Use the strongest tracked toe when the other one is heavily occluded.
+    best_amplitude = max(movement_amplitudes[i] for i in eligible)
+    primary = [i for i in eligible if movement_amplitudes[i] >= max(4., 0.40*best_amplitude)]
+    if not primary:
+        primary = [max(eligible, key=lambda i: movement_amplitudes[i])]
+    combined = np.full(n, np.nan)
+    if len(primary) == 2:
+        a, b = rises[primary[0]], rises[primary[1]]
+        # Average with explicit counts avoids all-NaN warnings at dropouts.
+        matrix = np.stack((a, b))
+        counts = np.isfinite(matrix).sum(axis=0)
+        np.divide(np.nansum(matrix, axis=0), counts, out=combined, where=counts > 0)
+    else:
+        combined = rises[primary[0]].copy()
+    out['both'] = combined
+    filled = _fill_for_motion(combined)
+    if filled is None:
+        a,b = max(0,n//3), min(n-1,max(1,n*2//3))
+        out.update(takeoff=int(a),landing=int(b),quality='仮候補・座標不足',
+                   reason='有効なつま先座標がなく動画中央の確認位置を表示しています。')
         return out
-    quality, a, b, peak = max(options)
-    out.update(takeoff=int(a), landing=int(b),
-               quality="参考候補（要目視確認）",
-               reason=f"両つま先の上昇・下降から候補を推定。ピーク上昇 {peak:.1f}px。接地は直接測っていません。",
-               score=float(quality))
+    # Smooth the fused signal once more to reject detection flicker.
+    win = min(n if n%2 else n-1, max(3, int(round(fps*0.065))|1))
+    smoothed = np.convolve(np.pad(filled,(win//2,win//2),mode='edge'),
+                          np.ones(win)/win,mode='valid')
+    # Peak search ignores pre/post static margins if possible, but does not
+    # require a perfect baseline (previous strict detector did).
+    margin = max(1, int(round(fps*0.20)))
+    region_l, region_r = (margin,n-margin) if n>2*margin+2 else (0,n)
+    peak = int(region_l+np.argmax(smoothed[region_l:region_r]))
+    peak_value = float(smoothed[peak])
+    # Motion amplitude is compared with noise and with the shape of the jump.
+    tail = np.r_[smoothed[:max(3,edge//2)],smoothed[-max(3,edge//2):]]
+    ground = float(np.median(tail))
+    amplitude = max(0.,peak_value-ground)
+    noise = min(noise_estimates[i] for i in primary)
+    min_significant = max(5.,4.0*noise)
+    out['movement_px'] = float(amplitude)
+    out['threshold_px'] = float(min_significant)
+    out['peak_frame'] = peak
+    # Detect the onset/end of the dominant excursion, rather than demanding
+    # that both toes rise higher than an absolute threshold for 100ms.
+    dynamic = max(3.,amplitude)
+    trigger = ground + max(2.0, 0.14*dynamic, 1.3*noise)
+    strong = ground + max(3.0, 0.35*dynamic, 2.0*noise)
+    # The first/last low crossing contiguous to the strongest high-motion peak.
+    # To suppress irrelevant early tiny wobble, first identify the 35% core.
+    lcore = peak
+    while lcore>1 and smoothed[lcore-1] >= strong:
+        lcore -= 1
+    rcore = peak
+    while rcore < n-2 and smoothed[rcore+1] >= strong:
+        rcore += 1
+    # Extend only a bounded interval into weak movement so earlier squat/
+    # post-landing movement does not contaminate boundaries.
+    span = max(3, int(round(fps*0.28)))
+    start = lcore
+    while start>max(1,lcore-span) and smoothed[start-1] >= trigger:
+        start-=1
+    end = rcore
+    while end<min(n-2,rcore+span) and smoothed[end+1] >= trigger:
+        end+=1
+    # Check that the motion is an actual rise then fall, not just noise.
+    # Use true timestamps for VFR footage.
+    seconds = float(time[end]-time[start])
+    plausible = (0.16 <= seconds <= 1.30)
+    strong_enough = (amplitude >= min_significant)
+    meaningful_shape = (lcore < peak < rcore and start < peak < end)
+    adequate_coverage = max(raw_coverage) >= 0.55
+    if not plausible:
+        # Prefer plausible intervals around the strongest excursion, while
+        # keeping it explicitly a placeholder instead of claiming a jump.
+        half = max(2,int(round(fps*0.26)))
+        if peak-start < max(2,int(round(fps*0.06))):
+            start=max(0,peak-half)
+        if end-peak < max(2,int(round(fps*0.06))):
+            end=min(n-1,peak+half)
+    if end<=start:
+        start=max(0,min(n-2,peak-max(1,int(round(fps*.25)))))
+        end=min(n-1,max(start+1,peak+max(1,int(round(fps*.25)))))
+    reliability = strong_enough and meaningful_shape and adequate_coverage and plausible
+    out.update(takeoff=int(start), landing=int(end), reliable=bool(reliability),
+               score=float(min(1.,amplitude/max(10.,6.*noise))),
+               candidates=1 if reliability else 0,
+               evidence='十分' if reliability else '弱い',
+               quality='動きから推定した候補（要目視確認）' if reliability else '暫定候補（低信頼・要修正）',
+               reason=(f'大きなつま先移動：{amplitude:.1f}px、ノイズ目安：{noise:.1f}px。'
+                       f' 動きの中心は{peak}フレーム。'
+                       + ('' if reliability else ' 強い往復運動を十分に確認できていないため、推定位置は参考値です。')))
     return out
 
 
@@ -685,7 +781,7 @@ def inspect_video_fps(path, read_frame_times=False):
     return info
 
 
-def analyze_video(video_bytes, suffix, model_complexity, display_progress, capture_fps_override=None):
+def analyze_video(video_source, suffix, model_complexity, display_progress, capture_fps_override=None):
     """Run every frame with MediaPipe; output review JPGs and H264 MP4."""
     cap = None
     writer = None
@@ -694,7 +790,15 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
         raw_input = base / ("input" + suffix)
         raw_output = base / "skeleton_raw.mp4"
         h264_output = base / "skeleton_h264.mp4"
-        raw_input.write_bytes(video_bytes)
+        # Stream UploadedFile straight to disk to avoid allocating a second
+        # 50-500MB full-size bytes object in the Cloud Python process.
+        if hasattr(video_source, 'read'):
+            video_source.seek(0)
+            with raw_input.open('wb') as dest:
+                shutil.copyfileobj(video_source, dest, length=1024*1024)
+            video_source.seek(0)
+        else:
+            raw_input.write_bytes(video_source)
         try:
             cap = cv2.VideoCapture(str(raw_input))
             if not cap.isOpened():
@@ -1059,12 +1163,36 @@ def frame_preview(label, result, frame_number):
 def render_measure_tab(athlete_id, history):
     st.subheader("新しく測定する")
     st.write("動画を選ぶだけで骨格を解析し、離地と着地の候補を提示します。映像を確認してから記録を保存できます。")
-    video = st.file_uploader("ジャンプ動画をアップロード", type=["mp4", "mov", "avi"], key="athlete_video")
+    st.caption("📱 スマホでは写真ライブラリより『ファイルを選択』を推奨。4Gで400エラーが出る場合は、Wi-Fi接続後にアップロード欄をリセットして再試行してください。")
+    if 'uploader_generation' not in st.session_state:
+        st.session_state['uploader_generation'] = 0
+    video = st.file_uploader(
+        "ジャンプ動画をアップロード", type=["mp4", "mov", "avi", "mpeg4"],
+        key=f"athlete_video_{st.session_state['uploader_generation']}",
+        help="一度に1ファイル・最大500MB。400エラーはブラウザとサーバー間の通信時に発生する場合があります。"
+    )
+    with st.expander("アップロードが400エラーになる場合の対処", expanded=False):
+        st.write("① 動画はiPhoneの『ファイル』から選択 ② 安定したWi-Fiで送信 ③ ブラウザのページを再読み込み ④ 他のタブで同じJump Logを開かない ⑤ 下のボタンでアップロード欄を作り直す。")
+        st.caption("400エラーはPythonコードの実行前に発生することがあります。ここでの対処で再試行できますが、サーバー側のエラーまで完全に防ぐものではありません。")
+        if st.button("アップロード欄をリセット", key="reset_jump_uploader"):
+            st.session_state['uploader_generation'] += 1
+            st.session_state['analysis'] = None
+            st.session_state['active_video_hash'] = None
+            st.rerun()
     if video is None:
         st.info("**おすすめ：** 真横から全身・床を撮影し、ジャンプ前後に静止した場面を入れた5〜10秒の動画。60fps以上、可能なら120fpsで撮影してください。")
         return
-    video_bytes = video.getvalue()
-    video_hash = hashlib.sha256(video_bytes).hexdigest()
+    # UploadedFile lives in Streamlit RAM; hash in chunks and do not create
+    # another full bytes object until the user explicitly starts analysis.
+    video.seek(0)
+    digest = hashlib.sha256()
+    while True:
+        part = video.read(1024*1024)
+        if not part:
+            break
+        digest.update(part)
+    video.seek(0)
+    video_hash = digest.hexdigest()
     if st.session_state.get("analysis_owner") != athlete_id:
         st.session_state["analysis"] = None
         st.session_state["active_video_hash"] = None
@@ -1075,7 +1203,7 @@ def render_measure_tab(athlete_id, history):
         st.session_state["last_saved_measurement"] = None
         for k in ("takeoff_input", "landing_input", "review_confirmed", "manual_frames_changed", "eval_reference_confirmed"):
             st.session_state.pop(k, None)
-    st.caption(f"{video.name}（{len(video_bytes)/1048576:.1f} MB）")
+    st.caption(f"{video.name}（{video.size/1048576:.1f} MB）・アップロード済み")
     with st.expander("📋 アップロードされた動画のFPSを診断"):
         st.caption("この診断はスマホからサーバーに届いた動画ファイルそのものを調べます。")
         if st.button("動画のFPS情報を調べる", key="fps_diagnose"):
@@ -1084,7 +1212,10 @@ def render_measure_tab(athlete_id, history):
                 if diag_suffix not in [".mp4", ".mov", ".avi"]:
                     diag_suffix = ".mp4"
                 diag_path = Path(diag_dir) / ("upload" + diag_suffix)
-                diag_path.write_bytes(video_bytes)
+                video.seek(0)
+                with diag_path.open("wb") as out_file:
+                    shutil.copyfileobj(video, out_file, length=1024*1024)
+                video.seek(0)
                 info = inspect_video_fps(diag_path)
                 cv_cap = cv2.VideoCapture(str(diag_path))
                 try:
@@ -1105,9 +1236,8 @@ def render_measure_tab(athlete_id, history):
                     st.success("元動画は高FPSですがOpenCVが低く認識しています。AI解析ではFFprobeのFPSとフレーム時刻を優先します。")
             else:
                 st.warning("FFprobeでFPSを読めませんでした：" + info['error'])
-    if Path(video.name).suffix.lower() == ".mp4":
-        with st.expander("元動画を確認", expanded=False):
-            st.video(video_bytes, format="video/mp4")
+    # Skip duplicating uploaded video inside the page; phone uploads are large.
+    # Users can inspect the H264 skeleton version after analysis.
     with st.expander("AI解析の設定", expanded=False):
         model = st.selectbox("骨格モデル", [2, 1, 0], index=1,
                              format_func=lambda x: {2: "高精度 / Heavy（時間がかかる）", 1: "標準 / Full", 0: "高速 / Lite"}[x])
@@ -1141,8 +1271,9 @@ def render_measure_tab(athlete_id, history):
         status = st.empty()
         status.info("骨格検出 → 離地・着地候補の推定 → 再生用動画の生成")
         try:
+            # UploadedFile is streamed to temporary disk, not duplicated in RAM.
             result = analyze_video(
-                video_bytes, Path(video.name).suffix.lower(), model, progress,
+                video, Path(video.name).suffix.lower(), model, progress,
                 capture_fps_override=fps_override,
             )
             st.session_state["analysis"] = result
@@ -1191,16 +1322,12 @@ def render_measure_tab(athlete_id, history):
         )
     if fps < 60:
         st.warning("60fps未満の動画はフレーム誤差が大きいため、結果の解釈に注意してください。")
-    if pred["takeoff"] is None:
-        if st.session_state.get("manual_frames_changed", False):
-            st.info("自動検出は成立しませんでしたが、現在の離地・着地フレームは手動指定されたものです。")
-        else:
-            st.warning("自動検出に失敗しました。現在の数字は仮置きです。離地・着地フレームを選択してください。")
-        st.caption(pred["reason"])
-    else:
+    if pred["takeoff"] is not None:
         candidate_seconds = float(result["times"][pred["landing"]] - result["times"][pred["takeoff"]])
-        st.info(f"AIの参考候補：{height_cm(candidate_seconds):.1f} cm ｜ 滞空 {candidate_seconds:.3f} 秒 ｜ {pred['quality']}")
-        st.caption(f"判定の根拠：{pred.get('method', '骨格位置の変化')}。{pred['reason']}")
+        st.info(f"つま先動作の参考候補：{height_cm(candidate_seconds):.1f} cm ｜ 滞空 {candidate_seconds:.3f} 秒 ｜ {pred['quality']}")
+        st.caption(f"判定の根拠：{pred['method']}。{pred['reason']}")
+        if not pred.get('reliable', False):
+            st.warning("この候補は低信頼です。自動で候補フレームは表示していますが、接地の判定が成立したことを意味しません。必ず手動で直してください。")
     toe = result.get("toe_prediction", {})
     with st.expander("🦶 つま先のみの自動検出（実験版）", expanded=True):
         st.caption("MediaPipe 31番・32番の左右つま先（FOOT_INDEX）Y座標だけを自動判定に使用します。かかと・足首・腰・手動基準値は使いません。")
@@ -1211,7 +1338,7 @@ def render_measure_tab(athlete_id, history):
             st.write(f"自動候補：離地 **{toe_a}** / 着地 **{toe_b}**（{toe_b - toe_a}フレーム差）")
             st.write(f"参考値：滞空 {toe_dt:.3f}秒、跳躍高 {height_cm(toe_dt):.1f}cm")
         else:
-            st.warning("つま先のみの自動候補は作成できませんでした。" + toe.get("reason", ""))
+            st.info("動画のフレーム数が足りず、候補位置を表示できません。")
         toe_chart = pd.DataFrame({
             "左つま先の基準からの上昇(px)": toe.get("left"),
             "右つま先の基準からの上昇(px)": toe.get("right"),
@@ -1220,6 +1347,10 @@ def render_measure_tab(athlete_id, history):
         toe_chart.index.name = "動画時刻（秒）"
         st.line_chart(toe_chart)
         st.caption("線はつま先（MediaPipe FOOT_INDEX）の推定移動量であり、床との実距離や接地を直接測定していません。")
+        if toe.get("peak_frame") is not None:
+            st.caption(f"最大移動量 {toe['movement_px']:.1f}px / 大きな動きの判定目安 {toe['threshold_px']:.1f}px / 動きの中心フレーム {toe['peak_frame']} / 使用できた足 {toe['used_feet']}本")
+        if not toe.get('reliable', False):
+            st.warning("暫定候補です。強い動きの区間が不明瞭なため、離地・着地の画像確認後に修正してください。")
     st.video(result["video_h264"], format="video/mp4")
     st.download_button("骨格付き動画をダウンロード", result["video_h264"],
                        file_name="jump_with_skeleton.mp4", mime="video/mp4")
@@ -1250,9 +1381,9 @@ def render_measure_tab(athlete_id, history):
         if st.session_state.get("manual_frames_changed", False):
             st.info("手動で指定した離地・着地フレームから計算した参考値です。画像の確認を続けてください。")
         else:
-            st.warning("自動検出できていないため、現在のフレームは仮設定です。離地・着地を手動で修正してください。")
+            st.warning("現在のフレームは暫定候補です。離地・着地を手動で確認・修正してください。")
     elif not st.session_state.get("manual_frames_changed", False):
-        st.info("つま先の上下移動から推定した参考候補です。接地の瞬間と一致するとは限らないため、離地・着地の画像を必ず確認してください。")
+        st.info("つま先の大きな上下動から提示した参考候補です。接地の瞬間と一致するとは限らないため、離地・着地の画像を必ず確認してください。")
     st.caption("計算式：h = 9.81 × t² / 8。離地と着地の身体重心の高さが同じ場合の近似です。")
     st.caption(f"時刻計算：{result['time_source']}。平均FPSと実際の撮影間隔が違う動画では誤差が生じます。")
     with st.expander("🔬 卒業研究用：つま先自動検出と手動基準の比較", expanded=True):
@@ -1260,6 +1391,7 @@ def render_measure_tab(athlete_id, history):
         toe = result.get("toe_prediction", {})
         st.write(f"手動基準：離地 **{int(takeoff)}** / 着地 **{int(landing)}**（{int(landing)-int(takeoff)}フレーム差）")
         valid_auto = toe.get("takeoff") is not None and toe.get("landing") is not None
+        reliable_auto = bool(toe.get('reliable', False))
         if valid_auto:
             auto_a = int(toe["takeoff"])
             auto_b = int(toe["landing"])
@@ -1278,17 +1410,21 @@ def render_measure_tab(athlete_id, history):
         else:
             auto_a = auto_b = None
             auto_t = takeoff_error = landing_error = t_error = h_error = np.nan
-            st.warning("つま先自動検出が失敗しました。CSVには『検出失敗』として残します。手動結果との差は計算できません。")
+            st.warning("フレーム数が不足しており、この動画には暫定候補を表示できません。")
         agreed = st.checkbox("離地・着地の2画像を目視確認し、手動基準として記録する", key="eval_reference_confirmed")
         if agreed:
             evaluation = pd.DataFrame([{
                 "video_name": video.name,
                 "video_sha256": video_hash,
-                "method": "toes_31_32_only_v4",
+                "method": "toes_31_32_major_motion_v5",
                 "fps_reported": fps,
                 "time_source": result["time_source"],
                 "total_frames": n,
-                "auto_success": int(valid_auto),
+                "auto_success": int(reliable_auto),
+                "auto_proposal_available": int(valid_auto),
+                "auto_evidence": toe.get('evidence', '不足'),
+                "auto_quality": toe.get('quality', ''),
+                "movement_amplitude_px": toe.get('movement_px', np.nan),
                 "manual_takeoff_frame": int(takeoff),
                 "manual_landing_frame": int(landing),
                 "manual_flight_seconds": round(flight, 8),
@@ -1305,7 +1441,7 @@ def render_measure_tab(athlete_id, history):
             }])
             st.download_button("比較結果をCSVで保存", evaluation.to_csv(index=False).encode("utf-8-sig"),
                 file_name=f"jump_eval_toes_{video_hash[:8]}.csv", mime="text/csv", key="download_toe_evaluation")
-            st.caption("複数動画の比較CSVを集めれば、検出成功率・フレーム誤差・平均絶対誤差（MAE）を集計できます。")
+            st.caption("auto_successは十分な動きが観測できた場合のみ1です。低信頼の仮候補は位置を出しますが成功件数に含めません。")
 
     with st.expander("解析データを見る（検証用）"):
         px = pred["both"]
@@ -1494,7 +1630,7 @@ def main():
         st.exception(exc)
         st.info("ここに表示された赤いエラーと詳細をコピーすると、原因を特定できます。測定履歴は削除されていません。")
     st.divider()
-    st.caption("Jump Log | 個人記録向けのローカル試作版。自動判定結果は目視確認が必要です。")
+    st.caption("Jump Log v5 | つま先の大きな動きから離地・着地候補を推定。精度は検証中です。")
 
 
 if __name__ == "__main__":
