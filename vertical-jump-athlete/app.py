@@ -12,6 +12,9 @@ import subprocess
 import tempfile
 import shutil
 import urllib.request
+import re
+from urllib.parse import urlparse, parse_qs
+import gdown
 from types import SimpleNamespace
 from datetime import datetime, date
 from pathlib import Path
@@ -728,14 +731,14 @@ def inspect_video_fps(path, read_frame_times=False):
     FFprobe uses the video stream metadata, while OpenCV CAP_PROP_FPS can
     disagree for some phone files. Frame timestamps are preferred for VFR.
     """
-    info = {"fps": None, "frame_times": None, "frames": None,
+    info = {"fps": None, "frame_times": None, "frames": None, "width": None, "height": None,
             "duration": None, "error": ""}
     binary = shutil.which("ffprobe")
     if not binary:
         info["error"] = "ffprobeが見つかりません。Cloudのpackages.txtにffmpegを追加してください。"
         return info
     cmd = [binary, "-v", "error", "-select_streams", "v:0",
-           "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration",
+           "-show_entries", "stream=avg_frame_rate,r_frame_rate,nb_frames,duration,width,height:format=duration",
            "-of", "json", str(path)]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
@@ -748,6 +751,11 @@ def inspect_video_fps(path, read_frame_times=False):
             info["error"] = "映像ストリームが見つかりません。"
             return info
         stream = streams[0]
+        try:
+            info["width"] = int(stream.get("width"))
+            info["height"] = int(stream.get("height"))
+        except (ValueError, TypeError):
+            pass
         info["fps"] = _fraction_fps(stream.get("avg_frame_rate"))
         try:
             info["frames"] = int(stream["nb_frames"])
@@ -1160,25 +1168,139 @@ def frame_preview(label, result, frame_number):
              use_column_width=True)
 
 
+# ===== Original-media transfer (native Photos -> Google Drive -> Streamlit) =====
+# A Safari upload cannot ask the iOS Photos picker to deliver its original
+# representation. A native Drive upload avoids that browser picker. We only
+# accept Google Drive file IDs to avoid arbitrary URL requests (SSRF).
+
+def _drive_id_from_url(url):
+    url = url.strip()
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname not in {"drive.google.com", "www.drive.google.com"}:
+            raise ValueError("Googleドライブのhttps共有リンクを入力してください。")
+        match = re.fullmatch(r"/file/d/([A-Za-z0-9_-]{15,128})(?:/.*)?", parsed.path)
+        if match:
+            return match.group(1)
+        if parsed.path in ("/open", "/uc"):
+            value = parse_qs(parsed.query).get("id", [""])[0]
+            if re.fullmatch(r"[A-Za-z0-9_-]{15,128}", value):
+                return value
+        raise ValueError("ファイル単体の共有リンクを使用してください（フォルダのリンクは不可）。")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Googleドライブの共有リンクを読み取れません。") from exc
+
+
+class _DriveVideo:
+    """Stream file from a temp path without loading it into Python RAM."""
+    def __init__(self, path, filename):
+        self.path = Path(path)
+        self.name = filename
+        self.size = self.path.stat().st_size
+        self._fh = self.path.open("rb")
+
+    def read(self, n=-1):
+        return self._fh.read(n)
+
+    def seek(self, pos, whence=0):
+        return self._fh.seek(pos, whence)
+
+    def close(self):
+        self._fh.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _download_drive_original(file_id):
+    """Fetch the Google Drive *file bytes*, not its lower-res video preview."""
+    dest = Path(tempfile.gettempdir()) / ("jump_log_drive_" + uuid.uuid4().hex + ".mov")
+    try:
+        result = gdown.download(id=file_id, output=str(dest), quiet=True, use_cookies=False)
+        if not result or not dest.is_file() or dest.stat().st_size < 1024:
+            raise RuntimeError("元動画を取得できません。ファイル単体の共有設定を確認してください。")
+        if dest.stat().st_size > 500 * 1024 * 1024:
+            raise RuntimeError("元動画が500MBを超えています。短く撮影した動画を使ってください。")
+        # Reject HTML pages / wrong links. FFprobe decodes the input container.
+        info = inspect_video_fps(dest)
+        if info["fps"] is None:
+            raise RuntimeError("動画として読み込めません。Googleドライブのプレビューではなく元ファイルを指定してください。" + info.get("error", ""))
+        return dest, info
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
+
+
 def render_measure_tab(athlete_id, history):
     st.subheader("新しく測定する")
     st.write("動画を選ぶだけで骨格を解析し、離地と着地の候補を提示します。映像を確認してから記録を保存できます。")
-    st.caption("📱 スマホでは写真ライブラリより『ファイルを選択』を推奨。4Gで400エラーが出る場合は、Wi-Fi接続後にアップロード欄をリセットして再試行してください。")
-    if 'uploader_generation' not in st.session_state:
-        st.session_state['uploader_generation'] = 0
-    video = st.file_uploader(
-        "ジャンプ動画をアップロード", type=["mp4", "mov", "avi", "mpeg4"],
-        key=f"athlete_video_{st.session_state['uploader_generation']}",
-        help="一度に1ファイル・最大500MB。400エラーはブラウザとサーバー間の通信時に発生する場合があります。"
+    st.caption("元の120fps・4Kを残したい場合は『ライブラリの元動画』を選択してください。iOSのSafariによる変換を避けて取り込みます。")
+    source_mode = st.radio(
+        "動画の取り込み方法",
+        ["📱 写真ライブラリの元動画（Googleドライブ経由）", "📎 直接アップロード（従来方式）"],
+        horizontal=False,
+        key="jump_video_source_mode",
     )
-    with st.expander("アップロードが400エラーになる場合の対処", expanded=False):
-        st.write("① 動画はiPhoneの『ファイル』から選択 ② 安定したWi-Fiで送信 ③ ブラウザのページを再読み込み ④ 他のタブで同じJump Logを開かない ⑤ 下のボタンでアップロード欄を作り直す。")
-        st.caption("400エラーはPythonコードの実行前に発生することがあります。ここでの対処で再試行できますが、サーバー側のエラーまで完全に防ぐものではありません。")
-        if st.button("アップロード欄をリセット", key="reset_jump_uploader"):
-            st.session_state['uploader_generation'] += 1
-            st.session_state['analysis'] = None
-            st.session_state['active_video_hash'] = None
-            st.rerun()
+    video = None
+    if source_mode.startswith("📱"):
+        st.info("GoogleドライブのiPhoneアプリで『＋ → ファイルをアップロード → 写真と動画』から元動画を選び、アップロード後に共有リンクをコピーします。『ファイル』アプリへの保存は必要ありません。")
+        st.caption("注意：Googleドライブで元ファイルを保存する方法です。プレビュー再生の画質ではなく、ファイル自体を取得します。動画に個人情報が含まれる場合は共有リンクの取り扱いに注意してください。")
+        drive_url = st.text_input(
+            "Googleドライブの動画の共有リンク",
+            placeholder="https://drive.google.com/file/d/xxxxxxxxxxxx/view?usp=sharing",
+            key="jump_drive_url",
+        )
+        if st.button("📥 元動画をJump Logに取り込む", type="primary", key="jump_import_drive", use_container_width=True):
+            try:
+                drive_id = _drive_id_from_url(drive_url)
+                with st.spinner("Googleドライブから元動画ファイルを取得しています。変換・圧縮はしません。"):
+                    downloaded, metadata = _download_drive_original(drive_id)
+                old = st.session_state.get("jump_drive_local_path")
+                if old and old != str(downloaded):
+                    Path(old).unlink(missing_ok=True)
+                st.session_state["jump_drive_local_path"] = str(downloaded)
+                st.session_state["jump_drive_id"] = drive_id
+                st.session_state["jump_drive_metadata"] = metadata
+                st.success("Googleドライブの元動画を取り込めました。下にFPS・解像度を表示します。")
+            except Exception as exc:
+                st.error(f"取り込み失敗：{exc}")
+                st.caption("この方法には、動画ファイルを『リンクを知っている全員：閲覧者』に設定する必要があります。これは公開リンクなので、他人の映り込む動画や私的な動画では慎重に使用してください。")
+        local_path = st.session_state.get("jump_drive_local_path")
+        if local_path and Path(local_path).is_file():
+            video = _DriveVideo(local_path, "drive_original.mov")
+            metadata = st.session_state.get("jump_drive_metadata", {})
+            fps_value = metadata.get("fps")
+            w, h = metadata.get("width"), metadata.get("height")
+            st.write("**クラウドから取得した元ファイル：**")
+            st.write(f"ファイルサイズ：{video.size/1048576:.1f} MB")
+            if fps_value is not None:
+                st.write(f"平均FPS：**{fps_value:.3f} fps**　｜　解像度：**{w or '?'} × {h or '?'}**　｜　フレーム数：**{metadata.get('frames') or '不明'}**")
+                if fps_value < 100:
+                    st.warning("元の120fpsが残っていない可能性があります。Googleドライブへ送る前のファイルと比較してください。FPSを手動で120に変更してもフレームは戻りません。")
+            st.caption("転送後の動画には再エンコードを行っていません。元の撮影FPSと同じか、診断値を確認してください。")
+        elif local_path:
+            st.warning("一時動画が消えました。再度Googleドライブから取り込んでください。")
+    else:
+        if 'uploader_generation' not in st.session_state:
+            st.session_state['uploader_generation'] = 0
+        video = st.file_uploader(
+            "ジャンプ動画をアップロード", type=["mp4", "mov", "avi", "mpeg4"],
+            key=f"athlete_video_{st.session_state['uploader_generation']}",
+            help="一度に1ファイル・最大500MB。iPhoneの写真ライブラリは選択時に変換される場合があります。"
+        )
+        with st.expander("アップロードが400エラーになる場合の対処", expanded=False):
+            st.write("① ネットワークを確認 ② ブラウザを再読み込み ③ 同じJump Logを複数タブで開かない ④ 下のボタンでアップロード欄をリセット。")
+            st.caption("400エラーはPythonに届く前に発生することがあります。Googleドライブ経由ならこの経路を使わずに済みます。")
+            if st.button("アップロード欄をリセット", key="reset_jump_uploader"):
+                st.session_state['uploader_generation'] += 1
+                st.session_state['analysis'] = None
+                st.session_state['active_video_hash'] = None
+                st.rerun()
     if video is None:
         st.info("**おすすめ：** 真横から全身・床を撮影し、ジャンプ前後に静止した場面を入れた5〜10秒の動画。60fps以上、可能なら120fpsで撮影してください。")
         return
