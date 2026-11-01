@@ -93,22 +93,22 @@ def pose_features(pose_result, frame_height):
     return sole(FOOT_IDS[0]), sole(FOOT_IDS[1]), hip_y, scale
 
 
-def ankle_y_features(pose_result, frame_height):
-    """MediaPipe's left/right ANKLE y (27, 28); unavailable -> NaN."""
+def toe_y_features(pose_result, frame_height):
+    """MediaPipe Pose foot-index (toe-tip proxy) y, 31/32; unavailable -> NaN."""
     if not pose_result.pose_landmarks:
         return np.nan, np.nan
     pts = pose_result.pose_landmarks.landmark
     return tuple(
         float(pts[j].y * frame_height) if
         np.isfinite(pts[j].y) and pts[j].visibility >= 0.45 else np.nan
-        for j in (27, 28)
+        for j in (31, 32)
     )
 
 
-def detect_ankle_only(left_y_raw, right_y_raw, fps, times):
-    """Experimental two-ankle airborne *candidate* estimator, not contact truth.
+def detect_toe_only(left_y_raw, right_y_raw, fps, times):
+    """Experimental two-toe airborne *candidate* estimator, not contact truth.
 
-    Only MediaPipe landmark 27/28 y positions are used. Does not use a manually
+    Only MediaPipe landmark 31/32 y positions are used. Does not use a manually
     annotated jump or reference height as an input (avoids answer leakage).
     """
     left_y_raw = np.asarray(left_y_raw, dtype=float)
@@ -117,7 +117,7 @@ def detect_ankle_only(left_y_raw, right_y_raw, fps, times):
     n = len(left_y_raw)
     blank = np.full(n, np.nan)
     out = dict(takeoff=None, landing=None, quality="候補なし", reason="",
-               method="左右足首のみ（実験版）", left=blank.copy(),
+               method="左右つま先のみ（接地推定・要目視確認）", left=blank.copy(),
                right=blank.copy(), both=blank.copy(), hip=blank.copy(),
                coverage=0.0, candidates=0, score=None,
                left_y=blank.copy(), right_y=blank.copy(),
@@ -130,7 +130,7 @@ def detect_ankle_only(left_y_raw, right_y_raw, fps, times):
     good_raw = np.isfinite(left_y_raw) & np.isfinite(right_y_raw)
     out["coverage"] = float(good_raw.mean())
     if out["coverage"] < 0.40:
-        out["reason"] = "左右足首が同時に見えるフレームが40%未満です。"
+        out["reason"] = "左右つま先が同時に見えるフレームが40%未満です。"
         return out
     left = smooth_series(left_y_raw, fps)
     right = smooth_series(right_y_raw, fps)
@@ -147,9 +147,9 @@ def detect_ankle_only(left_y_raw, right_y_raw, fps, times):
         pre = pre[np.isfinite(pre)]
         post = post[np.isfinite(post)]
         if len(pre) < 4 or len(post) < 4:
-            out["reason"] = "動画の前後に静止した足首のフレームが不足しています。"
+            out["reason"] = "動画の前後に静止したつま先のフレームが不足しています。"
             return out
-        # y increases downwards: standing ankle y is approximately constant.
+        # y increases downwards: standing toe-tip proxy y is approximately constant.
         a, b = float(np.median(pre)), float(np.median(post))
         baseline = np.interp(idx, [0, n - 1], [a, b])
         clearance = baseline - series
@@ -163,9 +163,9 @@ def detect_ankle_only(left_y_raw, right_y_raw, fps, times):
     joint[~(np.isfinite(left) & np.isfinite(right))] = np.nan
     out["left"], out["right"], out["both"] = l_clear, r_clear, joint
     if np.isfinite(joint).mean() < 0.50:
-        out["reason"] = "補間後も左右足首を同時に追跡できません。"
+        out["reason"] = "補間後も左右つま先を同時に追跡できません。"
         return out
-    # A low threshold approximates the ankle leaving/returning to baseline;
+    # A low threshold approximates the toes leaving/returning to baseline;
     # a separate high core threshold rejects short foot wobbles.
     noise = max(noises)
     low = max(2.0, 1.7 * noise)
@@ -206,13 +206,13 @@ def detect_ankle_only(left_y_raw, right_y_raw, fps, times):
     out["candidates"] = len(options)
     if not options:
         out["reason"] = (
-            "左右足首が同時に基準位置から上昇し、戻る区間を確定できませんでした。"
-            "撮影前後の静止・足首の可視性・グラフを確認してください。")
+            "左右つま先が同時に基準位置から上昇し、戻る区間を確定できませんでした。"
+            "撮影前後の静止・つま先の可視性・グラフを確認してください。")
         return out
     quality, a, b, peak = max(options)
     out.update(takeoff=int(a), landing=int(b),
                quality="参考候補（要目視確認）",
-               reason=f"両足首の上昇・下降から候補を推定。ピーク上昇 {peak:.1f}px。接地は直接測っていません。",
+               reason=f"両つま先の上昇・下降から候補を推定。ピーク上昇 {peak:.1f}px。接地は直接測っていません。",
                score=float(quality))
     return out
 
@@ -731,7 +731,7 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
             if not writer.isOpened():
                 raise RuntimeError("骨格付き動画の保存を開始できませんでした。")
             props = [[], [], [], []]
-            ankle_props = [[], []]
+            toe_props = [[], []]
             timestamps_ms = []
             frames_jpeg = []
             landmark_count = 0
@@ -752,7 +752,7 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
                     features = pose_features(result, h)
                     for column, val in zip(props, features):
                         column.append(val)
-                    for column, val in zip(ankle_props, ankle_y_features(result, h)):
+                    for column, val in zip(toe_props, toe_y_features(result, h)):
                         column.append(val)
                     timestamps_ms.append(float(cap.get(cv2.CAP_PROP_POS_MSEC)))
                     if result.pose_landmarks:
@@ -801,9 +801,10 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
                 time_source = "FPS換算（近似）"
             display_progress.progress(0.90)
             legacy_prediction = detect_events(*props, fps, times)
-            ankle_prediction = detect_ankle_only(*ankle_props, fps, times)
-            prediction = (ankle_prediction if ankle_prediction["takeoff"] is not None
-                          else legacy_prediction)
+            toe_prediction = detect_toe_only(*toe_props, fps, times)
+            # Toe-only experiment: never substitute the older heel/hip detector,
+            # even when the toe-only candidate cannot be found.
+            prediction = toe_prediction
             command = [
                 imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
                 "-y", "-i", str(raw_output), "-c:v", "libx264", "-preset", "veryfast",
@@ -820,8 +821,8 @@ def analyze_video(video_bytes, suffix, model_complexity, display_progress, captu
                 "fps_override": capture_fps_override, "frames": n, "times": times,
                 "time_source": time_source, "pose_coverage": landmark_count / n,
                 "prediction": prediction, "legacy_prediction": legacy_prediction,
-                "ankle_prediction": ankle_prediction,
-                "raw_ankles": ankle_props, "preview_frames": frames_jpeg,
+                "toe_prediction": toe_prediction,
+                "raw_toes": toe_props, "preview_frames": frames_jpeg,
                 "video_h264": h264_output.read_bytes(), "resolution": (w, h),
                 "duration": float(times[-1]) if n else 0.0,
             }
@@ -1200,25 +1201,25 @@ def render_measure_tab(athlete_id, history):
         candidate_seconds = float(result["times"][pred["landing"]] - result["times"][pred["takeoff"]])
         st.info(f"AIの参考候補：{height_cm(candidate_seconds):.1f} cm ｜ 滞空 {candidate_seconds:.3f} 秒 ｜ {pred['quality']}")
         st.caption(f"判定の根拠：{pred.get('method', '骨格位置の変化')}。{pred['reason']}")
-    ankle = result.get("ankle_prediction", {})
-    with st.expander("🦶 足首のみの自動検出（実験版）", expanded=True):
-        st.caption("MediaPipe 27番・28番の左右足首Y座標だけを使います。腰・足先・手動の基準値は判定に使用しません。")
-        st.write(f"両足首の元データ検出率：{100 * ankle.get('coverage', 0):.1f}%")
-        if ankle.get("takeoff") is not None:
-            an_a, an_b = ankle["takeoff"], ankle["landing"]
-            ankle_dt = float(result["times"][an_b] - result["times"][an_a])
-            st.write(f"自動候補：離地 **{an_a}** / 着地 **{an_b}**（{an_b - an_a}フレーム差）")
-            st.write(f"参考値：滞空 {ankle_dt:.3f}秒、跳躍高 {height_cm(ankle_dt):.1f}cm")
+    toe = result.get("toe_prediction", {})
+    with st.expander("🦶 つま先のみの自動検出（実験版）", expanded=True):
+        st.caption("MediaPipe 31番・32番の左右つま先（FOOT_INDEX）Y座標だけを自動判定に使用します。かかと・足首・腰・手動基準値は使いません。")
+        st.write(f"両つま先の元データ検出率：{100 * toe.get('coverage', 0):.1f}%")
+        if toe.get("takeoff") is not None:
+            toe_a, toe_b = toe["takeoff"], toe["landing"]
+            toe_dt = float(result["times"][toe_b] - result["times"][toe_a])
+            st.write(f"自動候補：離地 **{toe_a}** / 着地 **{toe_b}**（{toe_b - toe_a}フレーム差）")
+            st.write(f"参考値：滞空 {toe_dt:.3f}秒、跳躍高 {height_cm(toe_dt):.1f}cm")
         else:
-            st.warning("足首のみの自動候補は作成できませんでした。" + ankle.get("reason", ""))
-        ankle_chart = pd.DataFrame({
-            "左足首の基準からの上昇(px)": ankle.get("left"),
-            "右足首の基準からの上昇(px)": ankle.get("right"),
-            "両足同時の上昇(px)": ankle.get("both"),
+            st.warning("つま先のみの自動候補は作成できませんでした。" + toe.get("reason", ""))
+        toe_chart = pd.DataFrame({
+            "左つま先の基準からの上昇(px)": toe.get("left"),
+            "右つま先の基準からの上昇(px)": toe.get("right"),
+            "両足同時の上昇(px)": toe.get("both"),
         }, index=np.asarray(result["times"]))
-        ankle_chart.index.name = "動画時刻（秒）"
-        st.line_chart(ankle_chart)
-        st.caption("線は足首の推定移動量です。床との実距離ではありません。")
+        toe_chart.index.name = "動画時刻（秒）"
+        st.line_chart(toe_chart)
+        st.caption("線はつま先（MediaPipe FOOT_INDEX）の推定移動量であり、床との実距離や接地を直接測定していません。")
     st.video(result["video_h264"], format="video/mp4")
     st.download_button("骨格付き動画をダウンロード", result["video_h264"],
                        file_name="jump_with_skeleton.mp4", mime="video/mp4")
@@ -1250,18 +1251,18 @@ def render_measure_tab(athlete_id, history):
             st.info("手動で指定した離地・着地フレームから計算した参考値です。画像の確認を続けてください。")
         else:
             st.warning("自動検出できていないため、現在のフレームは仮設定です。離地・着地を手動で修正してください。")
-    elif pred.get("quality", "").startswith("低信頼") and not st.session_state.get("manual_frames_changed", False):
-        st.warning("この候補は腰の動きからの推定で、離地・着地と一致する保証はありません。必ず手動で確認・修正してください。")
+    elif not st.session_state.get("manual_frames_changed", False):
+        st.info("つま先の上下移動から推定した参考候補です。接地の瞬間と一致するとは限らないため、離地・着地の画像を必ず確認してください。")
     st.caption("計算式：h = 9.81 × t² / 8。離地と着地の身体重心の高さが同じ場合の近似です。")
     st.caption(f"時刻計算：{result['time_source']}。平均FPSと実際の撮影間隔が違う動画では誤差が生じます。")
-    with st.expander("🔬 卒業研究用：足首自動検出と手動基準の比較", expanded=True):
+    with st.expander("🔬 卒業研究用：つま先自動検出と手動基準の比較", expanded=True):
         st.info("まず上の離地・着地を自分の目で選び直してください。手動で確認した値を基準にし、自動検出結果とは別に比較します。")
-        ankle = result.get("ankle_prediction", {})
+        toe = result.get("toe_prediction", {})
         st.write(f"手動基準：離地 **{int(takeoff)}** / 着地 **{int(landing)}**（{int(landing)-int(takeoff)}フレーム差）")
-        valid_auto = ankle.get("takeoff") is not None and ankle.get("landing") is not None
+        valid_auto = toe.get("takeoff") is not None and toe.get("landing") is not None
         if valid_auto:
-            auto_a = int(ankle["takeoff"])
-            auto_b = int(ankle["landing"])
+            auto_a = int(toe["takeoff"])
+            auto_b = int(toe["landing"])
             auto_t = float(result["times"][auto_b] - result["times"][auto_a])
             takeoff_error = auto_a - int(takeoff)
             landing_error = auto_b - int(landing)
@@ -1277,13 +1278,13 @@ def render_measure_tab(athlete_id, history):
         else:
             auto_a = auto_b = None
             auto_t = takeoff_error = landing_error = t_error = h_error = np.nan
-            st.warning("足首自動検出が失敗しました。CSVには『検出失敗』として残します。手動結果との差は計算できません。")
+            st.warning("つま先自動検出が失敗しました。CSVには『検出失敗』として残します。手動結果との差は計算できません。")
         agreed = st.checkbox("離地・着地の2画像を目視確認し、手動基準として記録する", key="eval_reference_confirmed")
         if agreed:
             evaluation = pd.DataFrame([{
                 "video_name": video.name,
                 "video_sha256": video_hash,
-                "method": "ankles_27_28_only_v3",
+                "method": "toes_31_32_only_v4",
                 "fps_reported": fps,
                 "time_source": result["time_source"],
                 "total_frames": n,
@@ -1303,22 +1304,22 @@ def render_measure_tab(athlete_id, history):
                 "absolute_height_error_cm": round(abs(h_error), 5) if valid_auto else np.nan,
             }])
             st.download_button("比較結果をCSVで保存", evaluation.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"jump_eval_{video_hash[:8]}.csv", mime="text/csv", key="download_ankle_evaluation")
+                file_name=f"jump_eval_toes_{video_hash[:8]}.csv", mime="text/csv", key="download_toe_evaluation")
             st.caption("複数動画の比較CSVを集めれば、検出成功率・フレーム誤差・平均絶対誤差（MAE）を集計できます。")
 
     with st.expander("解析データを見る（検証用）"):
         px = pred["both"]
         if np.isfinite(px).any():
-            chart = pd.DataFrame({"推定した両足の床からの高さ（px）": px}, index=result["times"])
+            chart = pd.DataFrame({"つま先の基準からの上昇（px・推定）": px}, index=result["times"])
             chart.index.name = "秒"
             st.line_chart(chart)
         csv_data = pd.DataFrame({
             "frame": np.arange(n), "time_s": result["times"],
-            "left_clearance_px": pred["left"], "right_clearance_px": pred["right"],
-            "both_clearance_px": pred["both"], "hip_y_px": pred["hip"],
-            "left_ankle_y_px": result.get("raw_ankles", [[], []])[0],
-            "right_ankle_y_px": result.get("raw_ankles", [[], []])[1],
-            "ankle_both_clearance_px": result.get("ankle_prediction", {}).get("both"),
+            "left_toe_rise_px": pred["left"], "right_toe_rise_px": pred["right"],
+            "both_toe_rise_px": pred["both"],
+            "left_toe_y_px": result.get("raw_toes", [[], []])[0],
+            "right_toe_y_px": result.get("raw_toes", [[], []])[1],
+            "toe_both_clearance_px": result.get("toe_prediction", {}).get("both"),
         }).to_csv(index=False).encode("utf-8-sig")
         st.download_button("解析CSVを保存", csv_data, file_name="jump_landmarks.csv", mime="text/csv")
     st.divider()
